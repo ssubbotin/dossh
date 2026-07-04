@@ -1,27 +1,30 @@
 /*
  * DOSSHD - the DOS-side server for DOSSH (https://github.com/ssubbotin/dossh)
  *
- * M3: resident (TSR) remote console over COM1.
+ * M3/M4: resident (TSR) remote console, over serial or the network.
  *     DOSSHD hooks the timer tick (INT 1Ch) and goes resident; the tick
- *     handler mirrors the VGA text screen out the serial port in budgeted
- *     chunks and pumps received KEY frames into the BIOS keyboard buffer.
- *     Whatever runs in the foreground afterwards - COMMAND.COM, a BIOS
- *     flasher, an installer - is mirrored and remotely driven, with no
+ *     handler mirrors the VGA text screen out the chosen transport in
+ *     budgeted chunks and pumps received KEY frames into the BIOS keyboard
+ *     buffer. Whatever runs in the foreground afterwards - COMMAND.COM, a
+ *     BIOS flasher, an installer - is mirrored and remotely driven, with no
  *     cooperation from the program.
  *
- *         DOSSHD          install (AUTOEXEC.BAT-friendly: it returns)
- *         DOSSHD /S       status
- *         DOSSHD /U       uninstall (unhook + free the resident memory)
+ *         DOSSHD               install over COM1 (serial)
+ *         DOSSHD /NET [ip] [port]  install over TCP via a packet driver
+ *         DOSSHD /S            status
+ *         DOSSHD /U            uninstall (unhook + free the resident memory)
  *
- *     The tick path is DOS-call-free (port I/O and far memory only), so it
- *     is safe regardless of what the foreground program is doing in DOS -
- *     the classic InDOS/reentrancy trap never applies. Presence detection
- *     and uninstall use an INT 2Fh multiplex handler (AH=D5h) that hands
- *     back a magic-tagged state block.
+ *     Install forms are AUTOEXEC.BAT-friendly: they go resident and return.
+ *     The tick path is DOS-call-free (port I/O, far memory, and the packet
+ *     driver only), so it is safe regardless of what the foreground program
+ *     is doing in DOS - the classic InDOS/reentrancy trap never applies.
+ *     Presence detection and uninstall use an INT 2Fh multiplex handler
+ *     (AH=D5h) that hands back a magic-tagged state block.
  *
- * Transport is still the serial port (under QEMU, `-serial tcp:...,server`
- * bridges COM1 to a host TCP socket). A packet-driver transport is the next
- * milestone.
+ * The M4 transport is TCP carried over a DOS packet driver (net.c); the wire
+ * protocol above the byte stream is identical to the serial path, so the same
+ * client drives either. Under QEMU, `-serial tcp:...,server` bridges COM1 for
+ * the serial path, and user-net `hostfwd` reaches the packet-driver path.
  *
  * Build: Open Watcom, 16-bit real mode  ->  see build.sh
  *
@@ -31,7 +34,15 @@
 #include <dos.h>
 #include <i86.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "net.h"
+
+/* transport: 0 = serial (COM1), 1 = TCP over a packet driver (net.c) */
+static int g_net;
+static unsigned char net_ip[4] = { 10, 0, 2, 15 };
+static unsigned      net_port  = 5555;
 
 /* ---- COM1 16550 UART, polled ---------------------------------------- */
 #define COM1      0x3F8
@@ -97,6 +108,9 @@ static void put16( unsigned char *b, unsigned v )
 struct resident_state {
     char magic[6];                            /* STATE_MAGIC              */
     unsigned short psp;                       /* resident PSP segment     */
+    unsigned char  mode;                      /* 0 = serial, 1 = net      */
+    unsigned char  pkt_int;                   /* packet-driver INT (net)  */
+    unsigned       pkt_handle;                /* access_type handle (net) */
     void (__interrupt __far *old_1c)( void );
     void (__interrupt __far *old_2f)( void );
 };
@@ -212,9 +226,15 @@ static void tx_pump( void )
     if( tx_off >= tx_total )
         start_frame();
     while( budget-- && tx_off < tx_total ) {
-        while( (inp( U_LSR ) & 0x20) == 0 )   /* wait for TX holding empty */
-            pump_rx();                        /* ... without dropping keys */
-        outp( U_THR, tx_off < 14 ? hdr[tx_off] : tx_vram[tx_off - 14] );
+        unsigned char b = tx_off < 14 ? hdr[tx_off] : tx_vram[tx_off - 14];
+        if( g_net ) {
+            if( !net_tx_putc( b ) )           /* TCP send buffer full */
+                break;                        /* ... resume next tick */
+        } else {
+            while( (inp( U_LSR ) & 0x20) == 0 )   /* wait for TX holding empty */
+                pump_rx();                    /* ... without dropping keys */
+            outp( U_THR, b );
+        }
         tx_off++;
     }
 }
@@ -223,12 +243,36 @@ static void tx_pump( void )
 
 static volatile int in_tick;
 
+static void net_tick( void )
+{
+    static int was_conn;
+    int b, conn;
+
+    net_poll();                               /* rx + tcp + retransmit */
+    while( (b = net_rx_getc()) >= 0 )         /* feed received KEY bytes */
+        rx_byte( (unsigned char)b );
+
+    conn = net_connected();
+    if( conn && !was_conn )
+        tx_off = tx_total = 0;                /* new client: fresh frame */
+    was_conn = conn;
+
+    if( conn ) {
+        tx_pump();                            /* queue screen bytes  */
+        net_tx_flush();                       /* push them as segments */
+    }
+}
+
 static void __interrupt __far tick_isr( void )
 {
     if( !in_tick ) {
         in_tick = 1;
-        pump_rx();
-        tx_pump();
+        if( g_net ) {
+            net_tick();
+        } else {
+            pump_rx();
+            tx_pump();
+        }
         in_tick = 0;
     }
     _chain_intr( state.old_1c );
@@ -290,11 +334,24 @@ static int install( void )
     unsigned short psp = get_psp();
     unsigned short env, paras;
 
-    uart_init();
     rxlen  = 0;
     tx_off = tx_total = 0;                    /* first tick starts a frame */
+
+    if( g_net ) {
+        if( !net_open( net_ip[0], net_ip[1], net_ip[2], net_ip[3],
+                       net_port ) ) {
+            printf( "DOSSHD: no packet driver found (is one loaded?).\n" );
+            return 1;
+        }
+    } else {
+        uart_init();
+    }
+
     memcpy( state.magic, STATE_MAGIC, 6 );
-    state.psp    = psp;
+    state.psp        = psp;
+    state.mode       = (unsigned char)g_net;
+    state.pkt_int    = g_net ? net_pkt_int() : 0;
+    state.pkt_handle = g_net ? net_pkt_handle() : 0;
     state.old_1c = _dos_getvect( 0x1C );
     state.old_2f = _dos_getvect( 0x2F );
     _dos_setvect( 0x2F, mpx_isr );
@@ -308,9 +365,16 @@ static int install( void )
     }
 
     paras = block_paras( psp );
-    printf( "DOSSHD M3 - resident console on COM1 (115200 8N1), %u KB kept.\n"
-            "Screen is mirrored and remote keys injected until DOSSHD /U.\n",
-            ((unsigned long)paras * 16 + 1023) / 1024 );
+    if( g_net )
+        printf( "DOSSHD M4 - resident console over TCP %u.%u.%u.%u:%u via %02X:%02X:%02X:%02X:%02X:%02X,\n"
+                "  %u KB kept.  Connect a client; DOSSHD /U removes it.\n",
+                net_ip[0], net_ip[1], net_ip[2], net_ip[3], net_port,
+                g_mac[0], g_mac[1], g_mac[2], g_mac[3], g_mac[4], g_mac[5],
+                (unsigned)(((unsigned long)paras * 16 + 1023) / 1024) );
+    else
+        printf( "DOSSHD M3 - resident console on COM1 (115200 8N1), %u KB kept.\n"
+                "Screen is mirrored and remote keys injected until DOSSHD /U.\n",
+                (unsigned)(((unsigned long)paras * 16 + 1023) / 1024) );
     _dos_keep( 0, paras );                    /* stay resident; no return */
     return 0;                                 /* not reached */
 }
@@ -346,6 +410,12 @@ static int uninstall( void )
     _dos_setvect( 0x1C, old1c );
     _dos_setvect( 0x2F, old2f );
     _enable();
+    /* net mode: unregister our receiver from the packet driver before the
+       memory holding it is freed, or the next frame calls into freed code.
+       Use the resident copy's driver int/handle (this transient DOSSHD has
+       its own zeroed net.c globals). */
+    if( st->mode )
+        net_release( st->pkt_int, st->pkt_handle );
     _dos_freemem( rpsp );
     printf( "DOSSHD: uninstalled.\n" );
     return 0;
@@ -357,7 +427,8 @@ static int status( void )
     struct resident_state __far *st = find_resident( &conflict );
 
     if( st ) {
-        printf( "DOSSHD: installed, resident at %04X:0000.\n", st->psp );
+        printf( "DOSSHD: installed (%s), resident at %04X:0000.\n",
+                st->mode ? "network" : "serial", st->psp );
         return 0;
     }
     printf( conflict ? "DOSSHD: multiplex id %02Xh is taken by another TSR.\n"
@@ -365,20 +436,57 @@ static int status( void )
     return 1;
 }
 
+/* parse "a.b.c.d" into out[4]; returns 1 on success */
+static int parse_ip( const char *s, unsigned char *out )
+{
+    int i;
+    for( i = 0; i < 4; i++ ) {
+        long v = 0;
+        if( *s < '0' || *s > '9' )
+            return 0;
+        while( *s >= '0' && *s <= '9' )
+            v = v * 10 + ( *s++ - '0' );
+        if( v > 255 )
+            return 0;
+        out[i] = (unsigned char)v;
+        if( i < 3 ) {
+            if( *s != '.' )
+                return 0;
+            s++;
+        }
+    }
+    return *s == '\0';
+}
+
+static int opt_is( const char *a, const char *name )
+{
+    if( a[0] != '/' && a[0] != '-' )
+        return 0;
+    return stricmp( a + 1, name ) == 0;
+}
+
 int main( int argc, char *argv[] )
 {
     int conflict;
 
     if( argc > 1 ) {
-        char c = argv[1][1];
-        if( (argv[1][0] == '/' || argv[1][0] == '-') && argv[1][2] == '\0' ) {
-            if( c == 'u' || c == 'U' ) return uninstall();
-            if( c == 's' || c == 'S' ) return status();
+        if( opt_is( argv[1], "U" ) ) return uninstall();
+        if( opt_is( argv[1], "S" ) ) return status();
+        if( opt_is( argv[1], "NET" ) ) {
+            g_net = 1;
+            if( argc > 2 && !parse_ip( argv[2], net_ip ) ) {
+                printf( "DOSSHD: bad IP '%s'\n", argv[2] );
+                return 1;
+            }
+            if( argc > 3 )
+                net_port = (unsigned)atoi( argv[3] );
+        } else {
+            printf( "usage: DOSSHD                    install over serial (COM1)\n"
+                    "       DOSSHD /NET [ip] [port]   install over TCP (packet driver)\n"
+                    "       DOSSHD /S                 status\n"
+                    "       DOSSHD /U                 uninstall\n" );
+            return 1;
         }
-        printf( "usage: DOSSHD          install (go resident)\n"
-                "       DOSSHD /S      status\n"
-                "       DOSSHD /U      uninstall\n" );
-        return 1;
     }
     if( find_resident( &conflict ) ) {
         printf( "DOSSHD: already installed.\n" );

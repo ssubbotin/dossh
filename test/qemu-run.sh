@@ -1,17 +1,28 @@
 #!/bin/sh
-# Boot DOSSHD.EXE on FreeDOS under QEMU with COM1 bridged to a host TCP port,
-# then render it from the host:
+# Boot DOSSHD.EXE on FreeDOS under QEMU and expose it to a host TCP port, then
+# render it from the host with ./client/dossh 127.0.0.1 $PORT.
 #
-#   ./test/qemu-run.sh              # builds a floppy, launches QEMU
-#   ./client/dossh 127.0.0.1 5555   # (in another terminal) watch the screen
+# Two transports (TRANSPORT env, default serial):
+#
+#   TRANSPORT=serial  (default) COM1 bridged to tcp:127.0.0.1:$PORT; DOSSHD
+#                     mirrors over the serial line. Used by M1-M3 tests.
+#   TRANSPORT=pkt     an emulated NE2000 NIC + a DOS packet driver; DOSSHD /NET
+#                     listens with its own TCP stack, and QEMU user-net
+#                     forwards host tcp:$PORT to the guest. Used by M4 tests.
+#
+#   ./test/qemu-run.sh                    # serial
+#   TRANSPORT=pkt ./test/qemu-run.sh      # packet driver + TCP
+#   ./client/dossh 127.0.0.1 5555         # (either) watch / drive the screen
 #
 # Needs: qemu-system-i386, mtools (mcopy), unzip, curl. Downloads a FreeDOS
-# boot floppy on first run.
+# boot floppy and (pkt mode) the Crynwr packet-driver collection on first run.
 set -e
 cd "$(dirname "$0")/.."
 
 DOSSHD=${DOSSHD:-dosshd/DOSSHD.EXE}
 PORT=${PORT:-5555}
+TRANSPORT=${TRANSPORT:-serial}
+GUEST_IP=${GUEST_IP:-10.0.2.15}
 [ -f "$DOSSHD" ] || { echo "build first: (cd dosshd && ./build.sh)"; exit 1; }
 
 mkdir -p test/work && cd test/work
@@ -23,9 +34,27 @@ if [ ! -f FLOPPY.img ]; then
 fi
 
 cp -f FLOPPY.img dosshd.img
-# replace the FreeDOS installer's boot menu with a straight boot into DOSSHD
 printf 'DOS=HIGH\r\nFILES=20\r\n' > FDCONFIG.SYS
-printf '@ECHO OFF\r\nDOSSHD\r\n' > AUTOEXEC.BAT
+
+if [ "$TRANSPORT" = pkt ]; then
+    # AMD PCnet DOS packet driver (PCNTPK.COM) for QEMU's emulated pcnet NIC.
+    # A separate, freely-redistributable tool used only to bring the NIC up;
+    # never linked into (MIT) DOSSHD. PCnet is chosen because its send_pkt is a
+    # blind bus-master DMA hand-off that transmits from interrupt/TSR context
+    # (the NE2000's shared remote-DMA send does not - see docs/DESIGN.md).
+    if [ ! -f PCNTPK.COM ]; then
+        echo "fetching AMD PCnet packet driver (PCNTPK.COM)..."
+        curl -sSLo amdnic_2.zip "https://packetdriversdos.net/ZIP/amdnic_2.zip"
+        unzip -oj amdnic_2.zip "PKTDRVR/PCNTPK.COM" >/dev/null
+    fi
+    # load the packet driver at INT 0x60 (auto-detects the PCI NIC), then /NET
+    printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHD /NET %s %s\r\n' \
+        "$GUEST_IP" "$PORT" > AUTOEXEC.BAT
+    mcopy -i dosshd.img -o PCNTPK.COM ::PCNTPK.COM
+else
+    printf '@ECHO OFF\r\nDOSSHD\r\n' > AUTOEXEC.BAT
+fi
+
 mcopy -i dosshd.img -o FDCONFIG.SYS ::FDCONFIG.SYS
 mcopy -i dosshd.img -o AUTOEXEC.BAT ::AUTOEXEC.BAT
 mcopy -i dosshd.img -o "../../$DOSSHD" ::DOSSHD.EXE
@@ -34,7 +63,15 @@ if [ -f ../VIDTEST.EXE ]; then
     mcopy -i dosshd.img -o ../VIDTEST.EXE ::VIDTEST.EXE
 fi
 
-echo "QEMU: COM1 -> tcp:127.0.0.1:$PORT  (connect with ./client/dossh)"
-exec qemu-system-i386 -m 16 -fda dosshd.img -boot a \
-    -serial "tcp:127.0.0.1:$PORT,server,nowait" \
-    -display none -vga std
+if [ "$TRANSPORT" = pkt ]; then
+    echo "QEMU: PCnet + DOSSHD /NET, host tcp:127.0.0.1:$PORT -> guest $GUEST_IP:$PORT"
+    exec qemu-system-i386 -m 16 -fda dosshd.img -boot a \
+        -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-$GUEST_IP:$PORT" \
+        -device "pcnet,netdev=n0,mac=52:54:00:12:34:56" \
+        -display none -vga std
+else
+    echo "QEMU: COM1 -> tcp:127.0.0.1:$PORT  (connect with ./client/dossh)"
+    exec qemu-system-i386 -m 16 -fda dosshd.img -boot a \
+        -serial "tcp:127.0.0.1:$PORT,server,nowait" \
+        -display none -vga std
+fi

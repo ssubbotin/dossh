@@ -222,20 +222,41 @@ retransmit timer on the timer tick. No general windowing.
 **Config.** Static IP + listen port, defaulting to the QEMU user-net guest
 (`10.0.2.15`, gateway `10.0.2.2`), overridable on the command line.
 
-**Test harness (proven bring-up).** QEMU `ne2k_isa` at I/O `0x300`, IRQ 9,
-driven by the Crynwr **`NE2000.COM`** packet driver (`NE2000 0x60 9 0x300`) —
-confirmed loading and initialising the NIC (MAC `52:54:00:12:34:56`). QEMU
-`-netdev user` with `hostfwd=tcp::PORT-:10.0.2.15:PORT` maps a host port to
-the guest listener, so the existing client and E2E scripts connect to
-`127.0.0.1:PORT` exactly as before. `qemu-run.sh` gains a `TRANSPORT=pkt` mode
-(adds the NIC + hostfwd and loads the driver before DOSSHD); serial stays the
-default. The packet driver is fetched at test time (Crynwr `pktd11`, GPL — a
-separate tool, never linked into MIT DOSSHD).
+### 13.1 Interrupt-time send: the hard part, and the fix
 
-**Bring-up order** — packet driver + ARP/IP + a throwaway UDP-echo smoke test
-(smallest end-to-end loop) → TCP on top → swap the transport → `e2e-m4` green.
+A TSR has no foreground of its own — it services the network from the timer
+ISR. Calling the packet driver's `send_pkt` at *interrupt time* is the crux,
+and it took real work to get right. Two independent obstacles, both proven
+with QEMU packet captures (`-object filter-dump`):
 
-**Added risks.** The receiver callback's register/segment convention under
-Watcom (needs `#pragma aux`/asm — the classic footgun); NIC IRQ delivery under
-QEMU; TCP retransmit edge cases. Mitigated by the bottom-up, each-step-provable
-bring-up and by keeping the M3 serial mirror available as a debug channel.
+1. **The NIC/driver must do a "blind" transmit.** The **NE2000 (Crynwr
+   `NE2000.COM`)** send copies the frame to the card through the 8390's
+   *shared programmed remote-DMA window* — the same register path its receive
+   up-call uses. Issued from the timer ISR it returns success (CF=0) but
+   transmits nothing, and corrupts the NIC. This is architectural to the 8390;
+   no 8390 driver avoids it. **AMD PCnet (`PCNTPK.COM`)** instead does a
+   bus-master DMA hand-off: fill a host-RAM TX descriptor, poke `CSR0=TDMD`,
+   return — the TX-complete IRQ is never waited on, and there is no shared DMA
+   window. PCnet transmits fine from the ISR. (Precedent: `rmtdos`, a TSR twin
+   of DOSSHD, streams the screen over Ethernet from the IRQ0 tick.)
+
+2. **`send_pkt` must run on a real stack.** Even with PCnet, a send issued on
+   the tiny interrupted DOS stack silently fails (CF=0, nothing transmitted).
+   `pkt_send` therefore switches `SS:SP` to a private multi-KB DGROUP stack —
+   and *only* the driver `INT` runs there (interrupts disabled, rmtdos-style),
+   never a C call — reaching the driver through its IVT vector so no fixed INT
+   opcode is baked in. See `dosshd/pktrecv.asm:pkt_send_bigstack`. The single
+   non-reentrant tick is the sole caller of `send_pkt`; the receive up-call
+   only stages a frame, never sends.
+
+### 13.2 Test harness
+
+QEMU `-device pcnet` (PCI Am79C970A) driven by AMD **`PCNTPK.COM`**
+(`PCNTPK INT=0x60`; it auto-detects the PCI NIC). QEMU `-netdev user` with
+`hostfwd=tcp::PORT-:10.0.2.15:PORT` maps a host port to the guest listener, so
+the existing client and E2E scripts connect to `127.0.0.1:PORT` exactly as
+before. `qemu-run.sh` gains a `TRANSPORT=pkt` mode (adds the NIC + hostfwd and
+loads PCNTPK before DOSSHD); serial stays the default. The driver is fetched
+at test time (`amdnic_2.zip`, freely redistributable — a separate tool, never
+linked into MIT DOSSHD). Proven end-to-end by `test/e2e-m4.py`: TCP handshake,
+live screen stream, and remote key injection, all from the TSR over the wire.

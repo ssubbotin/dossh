@@ -46,8 +46,19 @@ give the foreground program time to drain it. The server drops keys when the
 ring is full. It resynchronises on the `"DSSH"` magic byte-by-byte, so a
 corrupt or truncated frame costs at most a few keys, not the session.
 
+## Transport
+
+The same length-framed byte stream runs over either transport, so one client
+drives both:
+
+- **Serial (M1–M3):** COM1 at 115200 8N1 (under QEMU, `-serial tcp:...,server`
+  bridges it to a host socket).
+- **Network (M4):** the server runs its own TCP stack (`dosshd/net.c`) over a
+  DOS packet driver and listens on a static IP:port; the client connects to
+  that TCP port. The wire framing above is byte-for-byte identical.
+
 ## Planned (later milestones)
 
 - `type` 3+: cell-diff frames (only changed runs) for bandwidth/latency.
 - `HELLO`/`MODE`/`BELL`/`BYE` control messages; `modifiers` semantics.
-- A UDP/TCP-over-packet-driver transport replacing serial as the primary path.
+- Auth + optional encryption over the network transport.

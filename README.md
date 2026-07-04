@@ -3,12 +3,12 @@
 **SSH-style remote access to a real-mode DOS PC** — see the screen and drive the
 keyboard of a headless DOS machine over TCP/IP.
 
-> **Status: resident and interactive (over serial).** `DOSSHD` installs as a
-> TSR: the screen mirror and keyboard injection keep working while any
-> separately launched program runs — including ones that write straight to
-> video memory — proven end-to-end in QEMU. The network (packet-driver)
-> transport is next. See [docs/DESIGN.md](docs/DESIGN.md) for the
-> architecture.
+> **Status: resident, interactive, and networked.** `DOSSHD` installs as a
+> TSR — the screen mirror and keyboard injection keep working while any
+> separately launched program runs (including ones that write straight to
+> video memory) — and it now carries the session over **TCP via a DOS packet
+> driver**, not just serial. All proven end-to-end in QEMU. See
+> [docs/DESIGN.md](docs/DESIGN.md) for the architecture.
 
 ## Why
 
@@ -65,20 +65,24 @@ reach it from anywhere on the network.
       uninstall) and mirrors/drives separately launched programs, including
       direct-video ones — `test/e2e-m3.py` proves it against a program that
       writes straight to `B800:0` and reads `INT 16h`.
-- [ ] **Network transport:** TCP/UDP over a DOS packet driver instead of the
-      serial port.
+- [x] **Network transport:** an in-house TCP/IP stack over a DOS packet driver
+      (AMD PCnet), so a networked box is reachable from anywhere — proven from
+      the TSR with `test/e2e-m4.py` (handshake, live screen, keys over TCP).
 - [ ] **Screen diffing** and geometry-change handling.
 - [ ] **Telnet/ANSI-compatible** mode (connect with a stock `telnet`/`nc`, no custom
       client needed).
-- [ ] **MIT-clean TCP/IP layer** (see the licensing note in the design doc).
+- [x] **MIT-clean TCP/IP layer** — a small purpose-built ARP/IP/TCP stack
+      (`dosshd/net.c`), no third-party stack, so the release stays MIT.
 - [ ] Authentication; optional transport encryption.
 
 ## Building & testing
 
 The target toolchain is **Open Watcom** (16-bit real mode), which cross-compiles
-from Linux. Testing is done in **QEMU** with a well-supported DOS NIC
-(NE2000 / PCnet / e1000) and its packet driver — real-hardware NIC support in DOS is
-hit-or-miss, so the emulator is the reference environment.
+from Linux. Testing is done in **QEMU**: the serial path over COM1, and the
+network path over an emulated **AMD PCnet** NIC (`-device pcnet`) driven by the
+`PCNTPK.COM` packet driver. PCnet is used because its driver transmits from
+interrupt/TSR context (its send is a bus-master DMA hand-off); the NE2000's
+shared programmed-DMA send does not — see [docs/DESIGN.md](docs/DESIGN.md) §13.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full architecture, the interrupt and
 memory details, and the wire-protocol sketch.

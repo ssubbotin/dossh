@@ -21,7 +21,12 @@ fi
 # -bcl=dos : compile+link, DOS target      -ms : small model (far ptrs explicit)
 # -0       : 8086 (max compatibility)       -os : optimise for size
 # -q/-zq   : quiet
-wcl -zq -bcl=dos -ms -0 -os -fe=dosshd.exe dosshd.c
+#
+# The packet receiver is a far routine the driver calls at interrupt time; it
+# is written in assembly (pktrecv.asm) so the buffer hand-off and DS setup are
+# exact. dosshd.c + net.c are the C parts.
+wasm -zq -fo=pktrecv.obj pktrecv.asm
+wcl -zq -bcl=dos -ms -0 -os -fe=dosshd.exe dosshd.c net.c pktrecv.obj
 
 # DOS-friendly upper-case name
 cp -f dosshd.exe DOSSHD.EXE 2>/dev/null || true
