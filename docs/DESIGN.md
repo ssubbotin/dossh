@@ -122,7 +122,11 @@ retransmit/rwnd — a few hundred lines over the packet-driver API). It only has
 carry one interactive stream, so it can be far smaller than a general stack. mTCP is
 used **only as a reference / early prototype**, never redistributed.
 
-## 8. Wire protocol (sketch)
+## 8. Wire protocol (sketch — historical)
+
+> **Superseded by §14.** M1–M4 implemented the binary `SCREEN`/`KEY` framing
+> below (see `docs/PROTOCOL.md`); M5 replaces it with a telnet/ANSI console. The
+> sketch is kept for context.
 
 Binary, length-prefixed frames. Server -> client:
 
@@ -170,9 +174,13 @@ A small cross-platform client (Python first, for speed of iteration) that:
    separately launched program (the real goal — watch a flasher run).
    `DOSSHD` goes resident with an INT 2Fh presence/uninstall handshake;
    `/S`/`/U` manage it.
-4. **M4 — packet-driver transport + MIT TCP layer**, screen diffing, geometry
-   changes. *(in progress — see §13 for the concrete design.)*
-5. **M5 — ANSI/telnet-compatible mode**, auth.
+4. **M4 — packet-driver transport + MIT TCP layer.** *(done — see §13.)* An
+   in-house ARP/IP/TCP stack over an AMD PCnet packet driver; the TSR services
+   sends from the timer ISR on a private stack.
+5. **M5 — telnet/ANSI console + cell-diffing.** *(next — see §14.)* Become a
+   telnet/ANSI terminal server (stock `telnet`/`nc`/PuTTY, no custom client),
+   diff-driven; retires the binary protocol and the Python client.
+6. **M6 — auth**, optional transport encryption; geometry/mode polish.
 
 ## 12. Risks & open questions
 
@@ -260,3 +268,66 @@ loads PCNTPK before DOSSHD); serial stays the default. The driver is fetched
 at test time (`amdnic_2.zip`, freely redistributable — a separate tool, never
 linked into MIT DOSSHD). Proven end-to-end by `test/e2e-m4.py`: TCP handshake,
 live screen stream, and remote key injection, all from the TSR over the wire.
+
+## 14. M5 — telnet/ANSI console (supersedes the binary protocol)
+
+M5 turns DOSSH into a **telnet/ANSI terminal server** for the DOS text screen:
+any stock `telnet` / `nc` / PuTTY over the network transport, or any serial
+terminal over COM1, shows the live screen and types into it — **no custom
+client**. This *retires* the binary `SCREEN`/`KEY` framing of §8 and the Python
+`client/dossh`. The mechanism underneath — screen scrape, BIOS key injection,
+serial + packet-driver transports, TSR residency, `/S`/`/U` — is unchanged; only
+the wire format above the transport changes. Rationale: for a text-mode screen
+over TCP, diff-driven ANSI is nearly as compact as the binary protocol and
+carries the screen faithfully (16 colours, blink, CP437 box-drawing), while a
+telnet server needs no install and matches the "reach a headless box from
+anywhere" goal. (SSH is impractical for a real-mode TSR — crypto is too heavy.)
+
+**Rendering — diff-driven ANSI.** Keep a `shadow[4000]` copy of the last-drawn
+80×25 screen. Each tick, one pass diffs live VRAM against the shadow (updating it
+in the same pass) and emits ANSI for changed cells: `ESC[row;colH`, an SGR only
+when the VGA attribute changes, then the character(s); changed spans ≤3 cells
+apart are coalesced. Output is paced at ~512 bytes/tick. A **full repaint**
+(`ESC[?25l` `ESC[2J` `ESC[H` + every cell, resumable across ticks) is sent on:
+connect (TCP rising edge), a serial-only ~2 s cadence (a mid-stream serial
+terminal resyncs), geometry/mode change, and as a fallback when >75 % of cells
+changed (CLS/scroll — cheaper and self-syncing). After each batch the terminal
+cursor is parked at `curRow/curCol`; shown/hidden per the BDA cursor shape at
+`0040:0060`. Idle → nothing sent. The top-right spinner is dropped (it corrupted
+live VRAM and defeated idle-suppression). 80×43/50 modes diff-fall-back to
+periodic full repaints (the 4 KB shadow diffs 80×25 only).
+
+**Characters — CP437→UTF-8.** A resident 256-entry table maps each cell byte to
+its UTF-8 glyph, so box-drawing/shading render on any UTF-8 terminal with zero
+config; C0/`0x7F` remap to their PC glyphs (no raw control bytes), and UTF-8
+never emits `0xFF` so no telnet escaping is needed. `/CP437RAW` opt-out emits the
+raw byte (needs a CP437-font terminal + telnet `0xFF`-doubling).
+
+**Input — server-side key map.** Raw terminal bytes → BIOS scancode/ascii →
+`inject_key`. The Python client's keymap ports to C (ASCII→scancode, shifted
+punctuation, CSI/SS3 escape sequences for arrows/F-keys). Telnet fixups:
+CR / CR-LF / CR-NUL → one Enter; DEL/`0x08` → Backspace; Ctrl-A..Z. Lone-ESC vs
+escape-sequence is disambiguated across ticks (buffer a pending ESC; inject a
+bare ESC if no continuation arrives next tick).
+
+**Telnet layer (network transport only).** On connect send `IAC WILL ECHO`,
+`IAC WILL SGA`, `IAC DO SGA`, `IAC WILL BINARY`, `IAC DO BINARY` (character mode,
+no double echo — the mirrored redraw *is* the echo — 8-bit clean). A loop-free
+responder answers inbound negotiation once per option and skips `IAC SB…SE`
+subnegotiations. Serial ANSI sends no IAC.
+
+**Decomposition + tests** (rework the QEMU E2E harness with a shared ANSI→grid
+decoder):
+- **M5a — ANSI diff renderer (output).** Over serial: boot FreeDOS, decode the
+  ANSI stream back to an 80×25 grid, assert the prompt appears; assert idle
+  bandwidth ≪ a full repaint; CLS → a full repaint.
+- **M5b — server key map (input).** Over serial: send raw key bytes, assert
+  `echo BANANA` output appears (decoded from ANSI).
+- **M5c — telnet + network.** Over the packet-driver TCP port: assert the opening
+  IAC bytes, decode ANSI, assert screen + typing; a pexpect check over stock
+  `telnet`/`nc`.
+- Retire `client/dossh`; rewrite `docs/PROTOCOL.md` to document the telnet/ANSI
+  behaviour; adapt e2e-m2/m3/m4.
+
+**Decisions (resolved):** telnet-only (retire the binary protocol + client);
+CP437→UTF-8 default + `/CP437RAW`; 4 KB shadow (diff 80×25, larger modes repaint).
