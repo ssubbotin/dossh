@@ -30,3 +30,6 @@
 
 # local session handoff (private infra notes)
 /KICKOFF.md
+
+# python
+__pycache__/

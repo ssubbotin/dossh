@@ -1,9 +1,10 @@
-# DOSSH wire protocol (M1)
+# DOSSH wire protocol (M1/M2)
 
-M1 streams the text screen one way, DOS -> client, as length-framed messages
-over a byte stream (serial in M1; TCP later). All integers are little-endian.
+The screen streams DOS -> client as length-framed messages over a byte
+stream (serial for now; TCP later); the client sends fixed-size KEY messages
+back over the same stream. All integers are little-endian.
 
-## Frame
+## SCREEN frame (server -> client)
 
 ```
 offset  size  field
@@ -26,9 +27,27 @@ the PC text buffer at `0xB8000`, sent verbatim.
 The client resynchronises by scanning for the `"DSSH"` magic, so a mid-stream
 connect recovers on the next frame.
 
+## KEY frame (client -> server, M2)
+
+```
+offset  size  field
+0       4     magic     = "DSSH"
+4       1     type      = 2 (KEY)
+5       1     scancode  BIOS scancode-set-1 make code
+6       1     ascii     character, or 0 for extended keys (arrows, F-keys)
+7       1     modifiers reserved, send 0
+```
+
+The server injects `(scancode << 8) | ascii` into the BIOS type-ahead ring at
+`0040:001E`, so any program reading the keyboard through `INT 16h` (DOS,
+`COMMAND.COM`, full-screen tools) receives the key as if typed locally. The
+ring holds only **15 keys**; clients must pace bulk input (e.g. pastes) to
+give the foreground program time to drain it. The server drops keys when the
+ring is full. It resynchronises on the `"DSSH"` magic byte-by-byte, so a
+corrupt or truncated frame costs at most a few keys, not the session.
+
 ## Planned (later milestones)
 
-- `type` 2: cell-diff frames (only changed runs) for bandwidth/latency.
-- client -> server `KEY` messages (scancode, ascii, modifiers) for input (M2).
-- `HELLO`/`MODE`/`BELL`/`BYE` control messages.
+- `type` 3+: cell-diff frames (only changed runs) for bandwidth/latency.
+- `HELLO`/`MODE`/`BELL`/`BYE` control messages; `modifiers` semantics.
 - A UDP/TCP-over-packet-driver transport replacing serial as the primary path.

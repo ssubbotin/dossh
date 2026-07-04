@@ -3,8 +3,10 @@
 **SSH-style remote access to a real-mode DOS PC** — see the screen and drive the
 keyboard of a headless DOS machine over TCP/IP.
 
-> **Status: early / work in progress.** The design is settled and an MVP is under
-> construction. See [docs/DESIGN.md](docs/DESIGN.md) for the full architecture.
+> **Status: interactive MVP working (over serial).** A full remote
+> `COMMAND.COM` session — live screen mirror plus keyboard injection — is
+> proven end-to-end in QEMU. The network (packet-driver) transport is next.
+> See [docs/DESIGN.md](docs/DESIGN.md) for the full architecture.
 
 ## Why
 
@@ -54,8 +56,11 @@ reach it from anywhere on the network.
 
 ## Roadmap
 
-- [ ] **MVP:** foreground server, full-screen frames, keyboard injection, a
-      `COMMAND.COM` session, and a custom client — proven in QEMU.
+- [x] **MVP:** foreground server, full-screen frames, keyboard injection, a
+      `COMMAND.COM` session, and a custom client — proven in QEMU
+      (serial transport; run `test/e2e-m2.py` to see it type by itself).
+- [ ] **Network transport:** TCP/UDP over a DOS packet driver instead of the
+      serial port.
 - [ ] **TSR / background** operation with screen diffing.
 - [ ] **Telnet/ANSI-compatible** mode (connect with a stock `telnet`/`nc`, no custom
       client needed).

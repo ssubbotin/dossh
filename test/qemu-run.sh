@@ -23,7 +23,10 @@ if [ ! -f FLOPPY.img ]; then
 fi
 
 cp -f FLOPPY.img dosshd.img
+# replace the FreeDOS installer's boot menu with a straight boot into DOSSHD
+printf 'DOS=HIGH\r\nFILES=20\r\n' > FDCONFIG.SYS
 printf '@ECHO OFF\r\nDOSSHD\r\n' > AUTOEXEC.BAT
+mcopy -i dosshd.img -o FDCONFIG.SYS ::FDCONFIG.SYS
 mcopy -i dosshd.img -o AUTOEXEC.BAT ::AUTOEXEC.BAT
 mcopy -i dosshd.img -o "../../$DOSSHD" ::DOSSHD.EXE
 
