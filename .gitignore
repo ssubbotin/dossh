@@ -1,0 +1,26 @@
+# Open Watcom / DOS build artifacts
+*.obj
+*.OBJ
+*.exe
+*.EXE
+*.map
+*.MAP
+*.err
+*.ERR
+*.lst
+*.LST
+*.sym
+*.o
+*.lib
+*.LIB
+*.bak
+
+# build / dist dirs
+/build/
+/dist/
+
+# editors / OS cruft
+*~
+.DS_Store
+.vscode/
+.idea/
