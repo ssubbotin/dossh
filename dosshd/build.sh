@@ -25,5 +25,10 @@ wcl -zq -bcl=dos -ms -0 -os -fe=dosshd.exe dosshd.c
 
 # DOS-friendly upper-case name
 cp -f dosshd.exe DOSSHD.EXE 2>/dev/null || true
-ls -l dosshd.exe DOSSHD.EXE 2>/dev/null
-echo "built dosshd/DOSSHD.EXE"
+
+# VIDTEST: direct-video test fixture / demo app (see ../test/vidtest.c)
+(cd ../test && wcl -zq -bcl=dos -ms -0 -os -fe=vidtest.exe vidtest.c \
+    && cp -f vidtest.exe VIDTEST.EXE)
+
+ls -l dosshd.exe DOSSHD.EXE ../test/VIDTEST.EXE 2>/dev/null
+echo "built dosshd/DOSSHD.EXE and test/VIDTEST.EXE"

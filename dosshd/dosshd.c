@@ -1,15 +1,23 @@
 /*
  * DOSSHD - the DOS-side server for DOSSH (https://github.com/ssubbotin/dossh)
  *
- * M2: interactive remote console over COM1.
- *     A timer-tick (INT 1Ch) handler mirrors the VGA text screen out the
- *     serial port in budgeted chunks and pumps received KEY frames into the
- *     BIOS keyboard buffer, while a spawned COMMAND.COM runs in the
- *     foreground. The remote operator sees the live screen and types into
- *     whatever the shell runs; `EXIT` ends the session and DOSSHD unhooks.
+ * M3: resident (TSR) remote console over COM1.
+ *     DOSSHD hooks the timer tick (INT 1Ch) and goes resident; the tick
+ *     handler mirrors the VGA text screen out the serial port in budgeted
+ *     chunks and pumps received KEY frames into the BIOS keyboard buffer.
+ *     Whatever runs in the foreground afterwards - COMMAND.COM, a BIOS
+ *     flasher, an installer - is mirrored and remotely driven, with no
+ *     cooperation from the program.
+ *
+ *         DOSSHD          install (AUTOEXEC.BAT-friendly: it returns)
+ *         DOSSHD /S       status
+ *         DOSSHD /U       uninstall (unhook + free the resident memory)
  *
  *     The tick path is DOS-call-free (port I/O and far memory only), so it
- *     is safe regardless of what the foreground program is doing in DOS.
+ *     is safe regardless of what the foreground program is doing in DOS -
+ *     the classic InDOS/reentrancy trap never applies. Presence detection
+ *     and uninstall use an INT 2Fh multiplex handler (AH=D5h) that hands
+ *     back a magic-tagged state block.
  *
  * Transport is still the serial port (under QEMU, `-serial tcp:...,server`
  * bridges COM1 to a host TCP socket). A packet-driver transport is the next
@@ -22,9 +30,8 @@
 #include <conio.h>
 #include <dos.h>
 #include <i86.h>
-#include <process.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
 
 /* ---- COM1 16550 UART, polled ---------------------------------------- */
 #define COM1      0x3F8
@@ -42,6 +49,10 @@
    mirror to ~2 fps for a full 80x25 frame and bounds time spent in the
    ISR on real 115200 hardware */
 #define TX_BUDGET 512
+
+/* INT 2Fh multiplex id for presence check / uninstall handshake */
+#define MPX_ID    0xD5
+#define STATE_MAGIC "DOSSH1"
 
 static void uart_init( void )
 {
@@ -80,6 +91,17 @@ static void put16( unsigned char *b, unsigned v )
     b[0] = (unsigned char)(v & 0xFF);
     b[1] = (unsigned char)((v >> 8) & 0xFF);
 }
+
+/* ---- resident state, discoverable through INT 2Fh -------------------- */
+
+struct resident_state {
+    char magic[6];                            /* STATE_MAGIC              */
+    unsigned short psp;                       /* resident PSP segment     */
+    void (__interrupt __far *old_1c)( void );
+    void (__interrupt __far *old_2f)( void );
+};
+
+static struct resident_state state;
 
 /* ---- keyboard injection: the BIOS type-ahead ring at 0040:001E ------- */
 
@@ -197,9 +219,8 @@ static void tx_pump( void )
     }
 }
 
-/* ---- INT 1Ch timer-tick service (DOS-call-free) ----------------------- */
+/* ---- resident interrupt handlers -------------------------------------- */
 
-static void (__interrupt __far *old_1c)( void );
 static volatile int in_tick;
 
 static void __interrupt __far tick_isr( void )
@@ -210,32 +231,162 @@ static void __interrupt __far tick_isr( void )
         tx_pump();
         in_tick = 0;
     }
-    _chain_intr( old_1c );
+    _chain_intr( state.old_1c );
 }
 
-int main( void )
+static void __interrupt __far mpx_isr( union INTPACK r )
 {
-    const char *comspec;
-    int rc;
+    if( r.h.ah == MPX_ID && r.h.al == 0x00 ) {  /* presence check */
+        r.h.al = 0xFF;
+        r.w.cx = FP_SEG( (void __far *)&state );
+        r.w.dx = FP_OFF( (void __far *)&state );
+        return;
+    }
+    _chain_intr( state.old_2f );
+}
 
-    printf( "DOSSHD M2 - screen mirror + remote keyboard on COM1 (115200 8N1).\n"
-            "Starting a shell; remote keys are injected into it. EXIT ends it.\n" );
+/* ---- transient part: install / status / uninstall --------------------- */
+
+static unsigned short get_psp( void )
+{
+    union REGS r;
+    r.h.ah = 0x62;                            /* DOS 3+: get PSP segment */
+    int86( 0x21, &r, &r );
+    return r.w.bx;
+}
+
+static unsigned short block_paras( unsigned short psp )
+{
+    /* size of a program's memory block, from its MCB (the paragraph
+       right below the PSP) */
+    return *(unsigned short __far *)MK_FP( psp - 1, 3 );
+}
+
+/* NULL: not installed. Otherwise the resident state block - unless the
+   multiplex id belongs to someone else, reported via *conflict. */
+static struct resident_state __far *find_resident( int *conflict )
+{
+    union REGS r;
+
+    *conflict = 0;
+    r.w.ax = (MPX_ID << 8) | 0x00;
+    r.w.cx = 0;
+    r.w.dx = 0;
+    int86( 0x2F, &r, &r );
+    if( r.h.al != 0xFF )
+        return NULL;
+    if( r.w.cx | r.w.dx ) {
+        struct resident_state __far *st =
+            (struct resident_state __far *)MK_FP( r.w.cx, r.w.dx );
+        if( _fmemcmp( st->magic, STATE_MAGIC, 6 ) == 0 )
+            return st;
+    }
+    *conflict = 1;
+    return NULL;
+}
+
+static int install( void )
+{
+    unsigned short psp = get_psp();
+    unsigned short env, paras;
+
     uart_init();
+    rxlen  = 0;
     tx_off = tx_total = 0;                    /* first tick starts a frame */
-
-    comspec = getenv( "COMSPEC" );
-    if( comspec == NULL )
-        comspec = "\\COMMAND.COM";
-
-    old_1c = _dos_getvect( 0x1C );
+    memcpy( state.magic, STATE_MAGIC, 6 );
+    state.psp    = psp;
+    state.old_1c = _dos_getvect( 0x1C );
+    state.old_2f = _dos_getvect( 0x2F );
+    _dos_setvect( 0x2F, mpx_isr );
     _dos_setvect( 0x1C, tick_isr );
-    rc = spawnl( P_WAIT, comspec, comspec, NULL );
-    _dos_setvect( 0x1C, old_1c );
 
-    if( rc == -1 ) {
-        printf( "DOSSHD: cannot run %s\n", comspec );
+    /* the environment block is not needed once resident */
+    env = *(unsigned short __far *)MK_FP( psp, 0x2C );
+    if( env ) {
+        _dos_freemem( env );
+        *(unsigned short __far *)MK_FP( psp, 0x2C ) = 0;
+    }
+
+    paras = block_paras( psp );
+    printf( "DOSSHD M3 - resident console on COM1 (115200 8N1), %u KB kept.\n"
+            "Screen is mirrored and remote keys injected until DOSSHD /U.\n",
+            ((unsigned long)paras * 16 + 1023) / 1024 );
+    _dos_keep( 0, paras );                    /* stay resident; no return */
+    return 0;                                 /* not reached */
+}
+
+static int uninstall( void )
+{
+    int conflict;
+    struct resident_state __far *st = find_resident( &conflict );
+    void (__interrupt __far *old1c)( void );
+    void (__interrupt __far *old2f)( void );
+    unsigned short rpsp, rend;
+    unsigned short seg1c, seg2f;
+
+    if( st == NULL ) {
+        printf( conflict ? "DOSSHD: multiplex id %02Xh is taken by another TSR.\n"
+                         : "DOSSHD: not installed.\n", MPX_ID );
         return 1;
     }
-    printf( "DOSSHD stopped.\n" );
+    /* only unhook if both vectors still point into the resident block;
+       otherwise another TSR hooked after us and unhooking would crash it */
+    rpsp  = st->psp;
+    rend  = rpsp + block_paras( rpsp );
+    seg1c = FP_SEG( _dos_getvect( 0x1C ) );
+    seg2f = FP_SEG( _dos_getvect( 0x2F ) );
+    if( seg1c < rpsp || seg1c >= rend || seg2f < rpsp || seg2f >= rend ) {
+        printf( "DOSSHD: another TSR hooked INT 1Ch/2Fh after DOSSHD;\n"
+                "        remove it first, then retry DOSSHD /U.\n" );
+        return 1;
+    }
+    old1c = st->old_1c;                       /* copy out before freeing */
+    old2f = st->old_2f;
+    _disable();
+    _dos_setvect( 0x1C, old1c );
+    _dos_setvect( 0x2F, old2f );
+    _enable();
+    _dos_freemem( rpsp );
+    printf( "DOSSHD: uninstalled.\n" );
     return 0;
+}
+
+static int status( void )
+{
+    int conflict;
+    struct resident_state __far *st = find_resident( &conflict );
+
+    if( st ) {
+        printf( "DOSSHD: installed, resident at %04X:0000.\n", st->psp );
+        return 0;
+    }
+    printf( conflict ? "DOSSHD: multiplex id %02Xh is taken by another TSR.\n"
+                     : "DOSSHD: not installed.\n", MPX_ID );
+    return 1;
+}
+
+int main( int argc, char *argv[] )
+{
+    int conflict;
+
+    if( argc > 1 ) {
+        char c = argv[1][1];
+        if( (argv[1][0] == '/' || argv[1][0] == '-') && argv[1][2] == '\0' ) {
+            if( c == 'u' || c == 'U' ) return uninstall();
+            if( c == 's' || c == 'S' ) return status();
+        }
+        printf( "usage: DOSSHD          install (go resident)\n"
+                "       DOSSHD /S      status\n"
+                "       DOSSHD /U      uninstall\n" );
+        return 1;
+    }
+    if( find_resident( &conflict ) ) {
+        printf( "DOSSHD: already installed.\n" );
+        return 1;
+    }
+    if( conflict ) {
+        printf( "DOSSHD: multiplex id %02Xh is taken by another TSR.\n", MPX_ID );
+        return 1;
+    }
+    return install();
 }

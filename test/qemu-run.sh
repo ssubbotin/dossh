@@ -29,6 +29,10 @@ printf '@ECHO OFF\r\nDOSSHD\r\n' > AUTOEXEC.BAT
 mcopy -i dosshd.img -o FDCONFIG.SYS ::FDCONFIG.SYS
 mcopy -i dosshd.img -o AUTOEXEC.BAT ::AUTOEXEC.BAT
 mcopy -i dosshd.img -o "../../$DOSSHD" ::DOSSHD.EXE
+# direct-video test app, if built (used by e2e-m3, handy for demos)
+if [ -f ../VIDTEST.EXE ]; then
+    mcopy -i dosshd.img -o ../VIDTEST.EXE ::VIDTEST.EXE
+fi
 
 echo "QEMU: COM1 -> tcp:127.0.0.1:$PORT  (connect with ./client/dossh)"
 exec qemu-system-i386 -m 16 -fda dosshd.img -boot a \

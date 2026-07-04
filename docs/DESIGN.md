@@ -161,14 +161,17 @@ A small cross-platform client (Python first, for speed of iteration) that:
 
 ## 11. Milestones
 
-1. **M1 — screen scraper + client, no residency.** Foreground program that opens a
-   socket, sends full 80x25 frames, and a Python client that renders them. Prove the
-   mirror.
-2. **M2 — keyboard injection.** Client keys reach `COMMAND.COM`. Now it is
-   interactive.
-3. **M3 — TSR + tick servicing.** Background operation; control a separately launched
-   program (the real goal — watch a flasher run).
-4. **M4 — MIT TCP layer**, screen diffing, geometry changes.
+1. **M1 — screen scraper + client, no residency.** *(done)* Foreground program
+   that sends full 80x25 frames over serial, and a Python client that renders
+   them. Prove the mirror.
+2. **M2 — keyboard injection.** *(done)* Client keys reach `COMMAND.COM`. Now it
+   is interactive.
+3. **M3 — TSR + tick servicing.** *(done)* Background operation; control a
+   separately launched program (the real goal — watch a flasher run).
+   `DOSSHD` goes resident with an INT 2Fh presence/uninstall handshake;
+   `/S`/`/U` manage it.
+4. **M4 — packet-driver transport + MIT TCP layer**, screen diffing, geometry
+   changes.
 5. **M5 — ANSI/telnet-compatible mode**, auth.
 
 ## 12. Risks & open questions

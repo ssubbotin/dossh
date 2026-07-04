@@ -3,10 +3,12 @@
 **SSH-style remote access to a real-mode DOS PC** — see the screen and drive the
 keyboard of a headless DOS machine over TCP/IP.
 
-> **Status: interactive MVP working (over serial).** A full remote
-> `COMMAND.COM` session — live screen mirror plus keyboard injection — is
-> proven end-to-end in QEMU. The network (packet-driver) transport is next.
-> See [docs/DESIGN.md](docs/DESIGN.md) for the full architecture.
+> **Status: resident and interactive (over serial).** `DOSSHD` installs as a
+> TSR: the screen mirror and keyboard injection keep working while any
+> separately launched program runs — including ones that write straight to
+> video memory — proven end-to-end in QEMU. The network (packet-driver)
+> transport is next. See [docs/DESIGN.md](docs/DESIGN.md) for the
+> architecture.
 
 ## Why
 
@@ -59,9 +61,13 @@ reach it from anywhere on the network.
 - [x] **MVP:** foreground server, full-screen frames, keyboard injection, a
       `COMMAND.COM` session, and a custom client — proven in QEMU
       (serial transport; run `test/e2e-m2.py` to see it type by itself).
+- [x] **TSR / background:** `DOSSHD` goes resident (`/S` status, `/U`
+      uninstall) and mirrors/drives separately launched programs, including
+      direct-video ones — `test/e2e-m3.py` proves it against a program that
+      writes straight to `B800:0` and reads `INT 16h`.
 - [ ] **Network transport:** TCP/UDP over a DOS packet driver instead of the
       serial port.
-- [ ] **TSR / background** operation with screen diffing.
+- [ ] **Screen diffing** and geometry-change handling.
 - [ ] **Telnet/ANSI-compatible** mode (connect with a stock `telnet`/`nc`, no custom
       client needed).
 - [ ] **MIT-clean TCP/IP layer** (see the licensing note in the design doc).
