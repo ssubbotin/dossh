@@ -171,7 +171,7 @@ A small cross-platform client (Python first, for speed of iteration) that:
    `DOSSHD` goes resident with an INT 2Fh presence/uninstall handshake;
    `/S`/`/U` manage it.
 4. **M4 — packet-driver transport + MIT TCP layer**, screen diffing, geometry
-   changes.
+   changes. *(in progress — see §13 for the concrete design.)*
 5. **M5 — ANSI/telnet-compatible mode**, auth.
 
 ## 12. Risks & open questions
@@ -185,3 +185,57 @@ A small cross-platform client (Python first, for speed of iteration) that:
 - **Security:** the transport is unauthenticated and unencrypted initially. This is
   documented loudly; auth and an optional cipher are on the roadmap. Not for hostile
   networks yet.
+
+## 13. M4 — network transport (concrete design)
+
+M4 replaces the serial byte stream with **TCP over a DOS packet driver**, so a
+headless networked DOS box is reachable from anywhere — the motivating case.
+
+**Transport seam.** The framing code (`start_frame`/`tx_pump` on the way out,
+`rx_byte` → `inject_key` on the way in) is decoupled from the byte transport
+behind a small `link` interface (`link_init`, `link_tx_ready`, `link_putc`,
+`link_poll`, `link_getc`). Serial and packet transports are two implementations
+selected at build time (`-DLINK_PKT`); the wire protocol and the **entire Python
+client are unchanged**. This keeps the M1–M3 serial path and its tests working.
+
+**Why TCP, not UDP.** TCP keeps the client and the DSSH byte-stream protocol
+frozen (the client already speaks TCP), delivers keystrokes reliably, and
+segments the 4 KB screen frames for free — UDP would force datagram
+sub-framing plus a key-ack layer and would change the client. The cost is a
+single-socket TCP state machine in the server, scoped small (§7): listen, one
+connection, three-way handshake, in-order stream, checksums, ACKs, and a dumb
+retransmit timer on the timer tick. No general windowing.
+
+**Stack (DOS side, all in the TSR, tick-serviced, DOS-call-free).**
+
+- **Packet driver** — locate it by scanning INT 0x60–0x7E for the `"PKT DRVR"`
+  signature; `get_address` for our MAC; `access_type` for ETH_P_IP and
+  ETH_P_ARP; `send_pkt` to transmit; a `receiver` callback (packet-driver
+  register convention) copies incoming frames into a small RX ring. The
+  callback runs in the NIC IRQ; the tick drains the ring.
+- **ARP** — reply to requests for our IP; learn the peer's MAC from the
+  Ethernet header of frames it sends (a reply-only server needs little else).
+- **IP** — parse/build with header checksum; static address for v1 (DHCP
+  later).
+- **TCP** — the single socket described above, feeding the `link` byte API.
+
+**Config.** Static IP + listen port, defaulting to the QEMU user-net guest
+(`10.0.2.15`, gateway `10.0.2.2`), overridable on the command line.
+
+**Test harness (proven bring-up).** QEMU `ne2k_isa` at I/O `0x300`, IRQ 9,
+driven by the Crynwr **`NE2000.COM`** packet driver (`NE2000 0x60 9 0x300`) —
+confirmed loading and initialising the NIC (MAC `52:54:00:12:34:56`). QEMU
+`-netdev user` with `hostfwd=tcp::PORT-:10.0.2.15:PORT` maps a host port to
+the guest listener, so the existing client and E2E scripts connect to
+`127.0.0.1:PORT` exactly as before. `qemu-run.sh` gains a `TRANSPORT=pkt` mode
+(adds the NIC + hostfwd and loads the driver before DOSSHD); serial stays the
+default. The packet driver is fetched at test time (Crynwr `pktd11`, GPL — a
+separate tool, never linked into MIT DOSSHD).
+
+**Bring-up order** — packet driver + ARP/IP + a throwaway UDP-echo smoke test
+(smallest end-to-end loop) → TCP on top → swap the transport → `e2e-m4` green.
+
+**Added risks.** The receiver callback's register/segment convention under
+Watcom (needs `#pragma aux`/asm — the classic footgun); NIC IRQ delivery under
+QEMU; TCP retransmit edge cases. Mitigated by the bottom-up, each-step-provable
+bring-up and by keeping the M3 serial mirror available as a debug channel.
