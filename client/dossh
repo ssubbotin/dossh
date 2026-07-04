@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""
+dossh - client for DOSSH (https://github.com/ssubbotin/dossh)
+
+M1: connect to a DOSSHD screen stream and render the DOS text screen live in
+this terminal. Under QEMU the stream is COM1 bridged to a TCP port with
+`-serial tcp:HOST:PORT,server`; connect to that.
+
+    dossh [host] [port]        (default 127.0.0.1 5555)
+
+Read-only for now (renders the screen). Keyboard forwarding is the next
+milestone. MIT License. Copyright (c) 2026 Sergey Subbotin.
+"""
+import socket
+import sys
+
+MAGIC = b"DSSH"
+HDR_LEN = 14
+
+# VGA palette index -> ANSI colour code offset (VGA and ANSI order differ)
+VGA2ANSI = [0, 4, 2, 6, 1, 5, 3, 7]  # blk blu grn cyn red mag brn wht
+
+
+def sgr(attr):
+    fg = attr & 0x0F
+    bg = (attr >> 4) & 0x07
+    fg_code = (30 + VGA2ANSI[fg]) if fg < 8 else (90 + VGA2ANSI[fg - 8])
+    bg_code = 40 + VGA2ANSI[bg]
+    return "\x1b[0;%d;%dm" % (fg_code, bg_code)
+
+
+def render(cols, rows, cur_row, cur_col, cells):
+    out = ["\x1b[H"]  # cursor home (no full clear -> less flicker)
+    last = None
+    for r in range(rows):
+        for c in range(cols):
+            i = (r * cols + c) * 2
+            ch, attr = cells[i], cells[i + 1]
+            if attr != last:
+                out.append(sgr(attr))
+                last = attr
+            out.append(bytes([ch]).decode("cp437"))
+        out.append("\x1b[0m\x1b[K")  # reset + clear to EOL
+        if r < rows - 1:
+            out.append("\r\n")
+        last = None
+    # park the terminal cursor where the DOS cursor is
+    out.append("\x1b[%d;%dH" % (cur_row + 1, cur_col + 1))
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+def read_exact(sock, n, buf):
+    while len(buf) < n:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("stream closed")
+        buf += chunk
+    return buf
+
+
+def main():
+    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5555
+    sys.stderr.write("dossh: connecting to %s:%d ...\n" % (host, port))
+    sock = socket.create_connection((host, port))
+    sys.stdout.write("\x1b[2J")  # clear once
+    buf = bytearray()
+    frames = 0
+    try:
+        while True:
+            # resync on magic
+            buf = read_exact(sock, HDR_LEN, buf)
+            if buf[:4] != MAGIC:
+                del buf[0]  # slide one byte and retry
+                continue
+            typ = buf[4]
+            cols, rows = buf[7], buf[8]
+            cur_row, cur_col = buf[9], buf[10]
+            plen = buf[11] | (buf[12] << 8)
+            buf = read_exact(sock, HDR_LEN + plen, buf)
+            payload = bytes(buf[HDR_LEN:HDR_LEN + plen])
+            del buf[:HDR_LEN + plen]
+            if typ == 1 and plen == cols * rows * 2:
+                render(cols, rows, cur_row, cur_col, payload)
+                frames += 1
+    except (KeyboardInterrupt, ConnectionError) as e:
+        sys.stdout.write("\x1b[0m\n")
+        sys.stderr.write("dossh: %s (%d frames)\n" % (e or "closed", frames))
+    finally:
+        sock.close()
+
+
+if __name__ == "__main__":
+    main()

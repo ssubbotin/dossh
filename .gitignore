@@ -24,3 +24,6 @@
 .DS_Store
 .vscode/
 .idea/
+
+# test scratch (FreeDOS floppy, etc.)
+/test/work/
