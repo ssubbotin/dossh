@@ -27,3 +27,6 @@
 
 # test scratch (FreeDOS floppy, etc.)
 /test/work/
+
+# local session handoff (private infra notes)
+/KICKOFF.md
