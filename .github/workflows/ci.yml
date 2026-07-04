@@ -1,0 +1,45 @@
+name: CI
+
+# Tier-1 checks only: lint, cross-build DOSSHD.EXE, and the native key-map unit
+# test. The QEMU end-to-end tests are NOT run here - they need a booted FreeDOS
+# under QEMU, run only in software emulation on hosted runners (no KVM), and the
+# packet-driver ones are tick-ISR timing-sensitive; run them locally with
+# ./test/run-tests.sh.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (build + test scripts)
+        run: shellcheck dosshd/build.sh test/qemu-run.sh test/run-tests.sh
+      - name: ruff (python tests: syntax + real errors)
+        run: pipx run ruff check --select E9,F test/
+
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Open Watcom
+        uses: open-watcom/setup-watcom@v1
+        with:
+          version: "2.0"
+      - name: Build DOSSHD.EXE (+ VIDTEST.EXE)
+        run: cd dosshd && ./build.sh
+      - name: Unit test - server key map
+        run: cc -o test_ansikey dosshd/ansikey.c test/test_ansikey.c && ./test_ansikey
+      - name: Upload DOSSHD.EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: DOSSHD.EXE
+          path: dosshd/DOSSHD.EXE
+          if-no-files-found: error

@@ -1,0 +1,37 @@
+name: Release
+
+# On a v* tag, cross-build DOSSHD.EXE and publish a (pre-)release with the
+# binary attached, so users can grab a working EXE without an Open Watcom
+# toolchain. v0.x tags are marked pre-release (pre-1.0: no auth yet).
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Open Watcom
+        uses: open-watcom/setup-watcom@v1
+        with:
+          version: "2.0"
+      - name: Build
+        run: cd dosshd && ./build.sh
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp dosshd/DOSSHD.EXE test/VIDTEST.EXE README.md LICENSE docs/PROTOCOL.md dist/
+          ( cd dist && zip -r "../dossh-${GITHUB_REF_NAME}.zip" . )
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dosshd/DOSSHD.EXE
+            dossh-*.zip
