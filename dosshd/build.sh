@@ -26,7 +26,8 @@ fi
 # is written in assembly (pktrecv.asm) so the buffer hand-off and DS setup are
 # exact. dosshd.c + net.c are the C parts.
 wasm -zq -fo=pktrecv.obj pktrecv.asm
-wcl -zq -bcl=dos -ms -0 -os -fe=dosshd.exe dosshd.c net.c pktrecv.obj
+wcl -zq -bcl=dos -ms -0 -os -fe=dosshd.exe \
+    dosshd.c net.c render.c cp437.c ansikey.c telnet.c pktrecv.obj
 
 # DOS-friendly upper-case name
 cp -f dosshd.exe DOSSHD.EXE 2>/dev/null || true

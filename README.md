@@ -3,12 +3,14 @@
 **SSH-style remote access to a real-mode DOS PC** — see the screen and drive the
 keyboard of a headless DOS machine over TCP/IP.
 
-> **Status: resident, interactive, and networked.** `DOSSHD` installs as a
-> TSR — the screen mirror and keyboard injection keep working while any
-> separately launched program runs (including ones that write straight to
-> video memory) — and it now carries the session over **TCP via a DOS packet
-> driver**, not just serial. All proven end-to-end in QEMU. See
-> [docs/DESIGN.md](docs/DESIGN.md) for the architecture.
+> **Status: resident, interactive, networked, and speaks telnet.** `DOSSHD`
+> installs as a TSR — the screen mirror and keyboard injection keep working
+> while any separately launched program runs (including ones that write
+> straight to video memory) — carries the session over **TCP via a DOS packet
+> driver** (not just serial), and mirrors the screen as **ANSI over telnet**,
+> so you connect with a stock `telnet`, `nc`, or PuTTY — **no custom client**.
+> All proven end-to-end in QEMU. See [docs/DESIGN.md](docs/DESIGN.md) for the
+> architecture.
 
 ## Why
 
@@ -45,32 +47,32 @@ reach it from anywhere on the network.
 
 ```
    [ your laptop ]  ── TCP/IP ──▶  [ real DOS PC running DOSSHD.EXE ]
-    dossh (client)                   packet driver  ->  TCP
-    renders 80x25 screen             scrape 0xB8000  ->  screen frames
-    forwards keystrokes              inject keys     ->  BIOS kbd buffer
+    telnet / nc / PuTTY              packet driver  ->  TCP (telnet)
+    renders the ANSI screen          scrape 0xB8000  ->  ANSI diff stream
+    sends keystrokes                 inject keys     ->  BIOS kbd buffer
 ```
 
 ## Components
 
-- **`DOSSHD.EXE`** — the DOS-side resident server (the "daemon").
-- **`dossh`** — a small cross-platform client that renders the text screen in your
-  terminal and forwards your keystrokes.
+- **`DOSSHD.EXE`** — the DOS-side resident server (the "daemon"). It speaks
+  telnet/ANSI, so the client is whatever terminal you already have.
 
 ## Roadmap
 
-- [x] **MVP:** foreground server, full-screen frames, keyboard injection, a
-      `COMMAND.COM` session, and a custom client — proven in QEMU
-      (serial transport; run `test/e2e-m2.py` to see it type by itself).
+- [x] **MVP:** foreground server, screen mirror, keyboard injection, a
+      `COMMAND.COM` session — proven in QEMU over serial.
 - [x] **TSR / background:** `DOSSHD` goes resident (`/S` status, `/U`
       uninstall) and mirrors/drives separately launched programs, including
       direct-video ones — `test/e2e-m3.py` proves it against a program that
       writes straight to `B800:0` and reads `INT 16h`.
 - [x] **Network transport:** an in-house TCP/IP stack over a DOS packet driver
-      (AMD PCnet), so a networked box is reachable from anywhere — proven from
-      the TSR with `test/e2e-m4.py` (handshake, live screen, keys over TCP).
-- [ ] **Screen diffing** and geometry-change handling.
-- [ ] **Telnet/ANSI-compatible** mode (connect with a stock `telnet`/`nc`, no custom
-      client needed).
+      (AMD PCnet), so a networked box is reachable from anywhere —
+      `test/e2e-m5c.py` drives it over TCP.
+- [x] **Telnet/ANSI console with screen diffing:** the mirror is a diff-driven
+      ANSI stream and the network side negotiates telnet, so you connect with a
+      stock `telnet`/`nc`/PuTTY — no custom client. Screen render, keystrokes,
+      and the telnet path are covered by `test/e2e-m5a.py`, `e2e-m5b.py`,
+      `e2e-m5c.py`, and the `test/test_ansikey.c` key-map unit test.
 - [x] **MIT-clean TCP/IP layer** — a small purpose-built ARP/IP/TCP stack
       (`dosshd/net.c`), no third-party stack, so the release stays MIT.
 - [ ] Authentication; optional transport encryption.

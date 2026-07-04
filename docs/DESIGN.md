@@ -146,12 +146,11 @@ custom client.
 
 ## 9. Client
 
-A small cross-platform client (Python first, for speed of iteration) that:
-
-- renders the 80x25 grid in the local terminal, mapping **CP437 -> Unicode** and
-  **VGA attributes -> ANSI colours**,
-- puts the terminal in raw mode and forwards keystrokes as `KEY` events,
-- reconnects and redraws on demand.
+**There is no custom client.** Through M4 a small Python client rendered the
+binary frames; M5 (§14) moved the CP437→Unicode mapping, the VGA→ANSI colour
+mapping, and the keystroke encoding *into the server*, which now speaks
+telnet/ANSI. The client is any stock terminal — `telnet`, `nc`, PuTTY, a serial
+terminal. The former Python client and its binary protocol were retired.
 
 ## 10. Build & test
 
@@ -177,9 +176,12 @@ A small cross-platform client (Python first, for speed of iteration) that:
 4. **M4 — packet-driver transport + MIT TCP layer.** *(done — see §13.)* An
    in-house ARP/IP/TCP stack over an AMD PCnet packet driver; the TSR services
    sends from the timer ISR on a private stack.
-5. **M5 — telnet/ANSI console + cell-diffing.** *(next — see §14.)* Become a
-   telnet/ANSI terminal server (stock `telnet`/`nc`/PuTTY, no custom client),
-   diff-driven; retires the binary protocol and the Python client.
+5. **M5 — telnet/ANSI console + cell-diffing.** *(done — see §14.)* A
+   telnet/ANSI terminal server (stock `telnet`/`nc`/PuTTY, no custom client):
+   `render.c` diffs the screen to an ANSI stream (`cp437.c` for UTF-8),
+   `ansikey.c` maps raw keystrokes to BIOS scancodes, `telnet.c` negotiates
+   character mode on the network side. Retired the binary protocol and the
+   Python client.
 6. **M6 — auth**, optional transport encryption; geometry/mode polish.
 
 ## 12. Risks & open questions

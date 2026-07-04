@@ -38,6 +38,9 @@
 #include <string.h>
 
 #include "net.h"
+#include "render.h"
+#include "ansikey.h"
+#include "telnet.h"
 
 /* transport: 0 = serial (COM1), 1 = TCP over a packet driver (net.c) */
 static int g_net;
@@ -76,32 +79,7 @@ static void uart_init( void )
     outp( U_MCR, 0x03 );       /* DTR, RTS                     */
 }
 
-/* ---- text-screen geometry from the BIOS Data Area (segment 0x40) ---- */
-static unsigned char __far *bda = (unsigned char __far *)MK_FP( 0x40, 0 );
-
-static unsigned scr_cols( void ) { return bda[0x4A]; }               /* # columns */
-static unsigned scr_rows( void ) { return bda[0x84] + 1; }           /* rows-1 (EGA+); 0 -> 25 */
-static unsigned char scr_mode( void ) { return bda[0x49]; }          /* current video mode */
-
-static unsigned char __far *scr_base( void )
-{
-    /* mode 7 is monochrome text at B000:0; colour text lives at B800:0 */
-    return (scr_mode() == 7) ? (unsigned char __far *)MK_FP( 0xB000, 0 )
-                             : (unsigned char __far *)MK_FP( 0xB800, 0 );
-}
-
-static void cursor_pos( unsigned char *row, unsigned char *col )
-{
-    unsigned pos = *(unsigned __far *)&bda[0x50];   /* page 0: low=col, high=row */
-    *col = (unsigned char)(pos & 0xFF);
-    *row = (unsigned char)((pos >> 8) & 0xFF);
-}
-
-static void put16( unsigned char *b, unsigned v )
-{
-    b[0] = (unsigned char)(v & 0xFF);
-    b[1] = (unsigned char)((v >> 8) & 0xFF);
-}
+/* Screen scrape + the ANSI screen renderer live in render.c. */
 
 /* ---- resident state, discoverable through INT 2Fh -------------------- */
 
@@ -119,7 +97,8 @@ static struct resident_state state;
 
 /* ---- keyboard injection: the BIOS type-ahead ring at 0040:001E ------- */
 
-static void inject_key( unsigned char scan, unsigned char ascii )
+/* non-static: ansikey.c injects mapped keystrokes through this */
+void inject_key( unsigned char scan, unsigned char ascii )
 {
     unsigned short __far *head = (unsigned short __far *)MK_FP( 0x40, 0x1A );
     unsigned short __far *tail = (unsigned short __far *)MK_FP( 0x40, 0x1C );
@@ -143,99 +122,34 @@ static void inject_key( unsigned char scan, unsigned char ascii )
     _enable();
 }
 
-/* ---- client -> server KEY frames: "DSSH", 2, scan, ascii, modifiers -- */
-
-static unsigned char rxbuf[8];
-static unsigned rxlen;
-
-static void rx_byte( unsigned char b )
-{
-    static const unsigned char prefix[5] = { 'D', 'S', 'S', 'H', 2 };
-    unsigned i;
-
-    rxbuf[rxlen++] = b;
-    for( ;; ) {
-        for( i = 0; i < rxlen && i < 5; i++ ) {
-            if( rxbuf[i] != prefix[i] )
-                break;
-        }
-        if( i == rxlen || i == 5 ) {          /* prefix still plausible */
-            if( rxlen == 8 ) {
-                inject_key( rxbuf[5], rxbuf[6] );
-                rxlen = 0;
-            }
-            return;
-        }
-        for( i = 1; i < rxlen; i++ )          /* resync: slide one byte */
-            rxbuf[i - 1] = rxbuf[i];
-        rxlen--;
-        if( rxlen == 0 )
-            return;
-    }
-}
+/* ---- input: raw terminal bytes -> keystrokes (ansikey.c) ------------- */
 
 static void pump_rx( void )
 {
     while( inp( U_LSR ) & 0x01 )
-        rx_byte( (unsigned char)inp( U_RBR ) );
+        ansi_key_byte( (unsigned char)inp( U_RBR ) );
 }
 
-/* ---- screen TX state machine (one SCREEN frame across many ticks) ---- */
-
-static unsigned char hdr[14];
-static unsigned tx_off;                       /* next byte to send        */
-static unsigned tx_total;                     /* header + payload length  */
-static unsigned char __far *tx_vram;
-static unsigned seq;
-
-static void start_frame( void )
-{
-    static const char spin[4] = { '|', '/', '-', '\\' };
-    unsigned cols = scr_cols();
-    unsigned rows = scr_rows();
-    unsigned bytes;
-    unsigned char cr, cc;
-
-    if( cols == 0 || cols > 132 ) cols = 80;
-    if( rows == 0 || rows > 60  ) rows = 25;
-    bytes   = cols * rows * 2;
-    tx_vram = scr_base();
-    cursor_pos( &cr, &cc );
-
-    /* proof-of-life: tick a spinner in the top-right cell of the real
-       screen, so the mirror is visibly live even at an idle prompt. */
-    tx_vram[ 2 * (cols - 1) + 0 ] = spin[ seq & 3 ];
-    tx_vram[ 2 * (cols - 1) + 1 ] = 0x1E;     /* yellow on blue */
-
-    /* frame header: "DSSH", type=1(SCREEN), seq, cols, rows, curRow, curCol, len */
-    hdr[0]='D'; hdr[1]='S'; hdr[2]='S'; hdr[3]='H'; hdr[4]=1;
-    put16( hdr + 5, seq );
-    hdr[7]=(unsigned char)cols; hdr[8]=(unsigned char)rows;
-    hdr[9]=cr; hdr[10]=cc;
-    put16( hdr + 11, bytes ); hdr[13]=0;
-
-    tx_off   = 0;
-    tx_total = 14 + bytes;
-    seq++;
-}
+/* ---- screen TX: pull ANSI bytes from render.c, pace onto the transport --- */
 
 static void tx_pump( void )
 {
     unsigned budget = TX_BUDGET;
 
-    if( tx_off >= tx_total )
-        start_frame();
-    while( budget-- && tx_off < tx_total ) {
-        unsigned char b = tx_off < 14 ? hdr[tx_off] : tx_vram[tx_off - 14];
+    while( budget-- ) {
+        int b = render_next_byte( !g_net );
+        if( b < 0 )
+            break;                            /* nothing more to send now */
         if( g_net ) {
-            if( !net_tx_putc( b ) )           /* TCP send buffer full */
-                break;                        /* ... resume next tick */
+            if( !net_tx_putc( b ) ) {         /* TCP send buffer full */
+                render_pushback( b );         /* ... resume next tick */
+                break;
+            }
         } else {
             while( (inp( U_LSR ) & 0x20) == 0 )   /* wait for TX holding empty */
                 pump_rx();                    /* ... without dropping keys */
-            outp( U_THR, b );
+            outp( U_THR, (unsigned char)b );
         }
-        tx_off++;
     }
 }
 
@@ -249,13 +163,17 @@ static void net_tick( void )
     int b, conn;
 
     net_poll();                               /* rx + tcp + retransmit */
-    while( (b = net_rx_getc()) >= 0 )         /* feed received KEY bytes */
-        rx_byte( (unsigned char)b );
 
     conn = net_connected();
-    if( conn && !was_conn )
-        tx_off = tx_total = 0;                /* new client: fresh frame */
+    if( conn && !was_conn ) {                 /* new client */
+        telnet_reset();
+        telnet_hello();                       /* negotiate char mode */
+        render_reset();                       /* then full repaint   */
+    }
     was_conn = conn;
+
+    while( (b = net_rx_getc()) >= 0 )         /* strip IAC, map keystrokes */
+        telnet_in( (unsigned char)b );
 
     if( conn ) {
         tx_pump();                            /* queue screen bytes  */
@@ -267,6 +185,7 @@ static void __interrupt __far tick_isr( void )
 {
     if( !in_tick ) {
         in_tick = 1;
+        ansi_key_tick();                      /* flush a pending lone ESC */
         if( g_net ) {
             net_tick();
         } else {
@@ -334,8 +253,8 @@ static int install( void )
     unsigned short psp = get_psp();
     unsigned short env, paras;
 
-    rxlen  = 0;
-    tx_off = tx_total = 0;                    /* first tick starts a frame */
+    ansi_key_init();                          /* build the keystroke tables */
+    render_reset();                           /* first tick paints the screen */
 
     if( g_net ) {
         if( !net_open( net_ip[0], net_ip[1], net_ip[2], net_ip[3],

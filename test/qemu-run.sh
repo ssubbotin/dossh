@@ -1,21 +1,22 @@
 #!/bin/sh
-# Boot DOSSHD.EXE on FreeDOS under QEMU and expose it to a host TCP port, then
-# render it from the host with ./client/dossh 127.0.0.1 $PORT.
+# Boot DOSSHD.EXE on FreeDOS under QEMU and expose it to a host TCP port. DOSSHD
+# speaks telnet/ANSI, so connect with any terminal: `telnet 127.0.0.1 $PORT`,
+# `nc 127.0.0.1 $PORT`, or PuTTY in raw/telnet mode.
 #
 # Two transports (TRANSPORT env, default serial):
 #
 #   TRANSPORT=serial  (default) COM1 bridged to tcp:127.0.0.1:$PORT; DOSSHD
-#                     mirrors over the serial line. Used by M1-M3 tests.
-#   TRANSPORT=pkt     an emulated NE2000 NIC + a DOS packet driver; DOSSHD /NET
-#                     listens with its own TCP stack, and QEMU user-net
-#                     forwards host tcp:$PORT to the guest. Used by M4 tests.
+#                     mirrors over the serial line as raw ANSI.
+#   TRANSPORT=pkt     an emulated PCnet NIC + the PCNTPK packet driver; DOSSHD
+#                     /NET listens with its own TCP stack (telnet), and QEMU
+#                     user-net forwards host tcp:$PORT to the guest.
 #
 #   ./test/qemu-run.sh                    # serial
 #   TRANSPORT=pkt ./test/qemu-run.sh      # packet driver + TCP
-#   ./client/dossh 127.0.0.1 5555         # (either) watch / drive the screen
+#   telnet 127.0.0.1 5555                 # (either) watch / drive the screen
 #
 # Needs: qemu-system-i386, mtools (mcopy), unzip, curl. Downloads a FreeDOS
-# boot floppy and (pkt mode) the Crynwr packet-driver collection on first run.
+# boot floppy and (pkt mode) the PCnet packet driver on first run.
 set -e
 cd "$(dirname "$0")/.."
 
@@ -70,7 +71,7 @@ if [ "$TRANSPORT" = pkt ]; then
         -device "pcnet,netdev=n0,mac=52:54:00:12:34:56" \
         -display none -vga std
 else
-    echo "QEMU: COM1 -> tcp:127.0.0.1:$PORT  (connect with ./client/dossh)"
+    echo "QEMU: COM1 -> tcp:127.0.0.1:$PORT  (connect with telnet/nc)"
     exec qemu-system-i386 -m 16 -fda dosshd.img -boot a \
         -serial "tcp:127.0.0.1:$PORT,server,nowait" \
         -display none -vga std

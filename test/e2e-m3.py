@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-End-to-end test for M3: TSR / background operation.
+End-to-end test for M3: TSR / background operation (telnet/ANSI transport).
 
 Boots the DOSSH floppy under QEMU. AUTOEXEC runs DOSSHD, which must go
 resident and *return*, leaving the primary COMMAND.COM at its prompt. The
-test then, entirely over the wire:
+test then, entirely over the wire (raw terminal bytes in, ANSI out), checks
+the things unique to a background TSR mirror:
 
-  1. types `echo BANANA`        - keys reach the primary shell
-  2. runs VIDTEST               - a separately launched program that writes
-                                  straight to B800:0 shows up in the mirror
-  3. types `x` into VIDTEST     - keys reach a program reading INT 16h
+  1. types `echo BANANA`   - keys reach the primary shell
+  2. runs VIDTEST          - a program that writes straight to B800:0 (no BIOS)
+                             still shows up in the mirror
+  3. types `x` into VIDTEST - keys reach a program reading INT 16h
   4. quits it, `echo AFTERTEST` - the shell is alive again
-  5. types `dosshd /u`          - uninstall: the mirror STOPS transmitting
+  5. types `dosshd /u`     - uninstall: the mirror STOPS transmitting
 
-Step 5 is the M3 discriminator: a non-resident DOSSHD cannot uninstall.
+Step 5 is the discriminator: a non-resident DOSSHD cannot uninstall, and the
+~2 s ANSI resync cadence means a *live* mirror is never silent for long - so
+sustained silence proves it truly unhooked.
 
 Exit 0 = pass, 1 = fail.
 MIT License. Copyright (c) 2026 Sergey Subbotin.
@@ -25,66 +28,48 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ansiterm import AnsiGrid
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PORT = int(os.environ.get("PORT", "5558"))
 BOOT_TIMEOUT = 120
 STEP_TIMEOUT = 30
-SILENCE_SECS = 4      # how long the line must stay dead after uninstall
-
-MAGIC = b"DSSH"
-HDR_LEN = 14
-
-SCAN = {"a": 0x1E, "b": 0x30, "c": 0x2E, "d": 0x20, "e": 0x12, "f": 0x21,
-        "g": 0x22, "h": 0x23, "i": 0x17, "j": 0x24, "k": 0x25, "l": 0x26,
-        "m": 0x32, "n": 0x31, "o": 0x18, "p": 0x19, "q": 0x10, "r": 0x13,
-        "s": 0x1F, "t": 0x14, "u": 0x16, "v": 0x2F, "w": 0x11, "x": 0x2D,
-        "y": 0x15, "z": 0x2C, " ": 0x39, "/": 0x35, "\r": 0x1C}
+SILENCE_SECS = 5      # must exceed the ~2 s live-mirror resync cadence
 
 
-def type_line(sock, text):
+def type_text(sock, text):
     for ch in text:
-        sock.sendall(MAGIC + bytes([2, SCAN[ch.lower()], ord(ch), 0]))
+        sock.sendall(ch.encode())
         time.sleep(0.06)
 
 
-def frames(sock, deadline):
-    buf = bytearray()
-    while time.time() < deadline:
-        while len(buf) >= HDR_LEN and buf[:4] != MAGIC:
-            del buf[0]
-        if len(buf) >= HDR_LEN and buf[:4] == MAGIC:
-            cols, rows_n = buf[7], buf[8]
-            plen = buf[11] | (buf[12] << 8)
-            if len(buf) >= HDR_LEN + plen:
-                typ = buf[4]
-                payload = bytes(buf[HDR_LEN:HDR_LEN + plen])
-                del buf[:HDR_LEN + plen]
-                if typ == 1 and plen == cols * rows_n * 2 and plen:
-                    yield ["".join(bytes([payload[(r * cols + c) * 2]])
-                                   .decode("cp437") for c in range(cols))
-                           for r in range(rows_n)]
-                continue
-        sock.settimeout(max(0.1, deadline - time.time()))
+def expect(sock, grid, seconds, pred, label):
+    end = time.time() + seconds
+    while time.time() < end:
+        if pred(grid):
+            print("e2e-m3: ok - %s" % label)
+            return
+        sock.settimeout(max(0.1, end - time.time()))
         try:
             chunk = sock.recv(65536)
         except socket.timeout:
-            return
+            continue
         if not chunk:
             raise ConnectionError("serial stream closed")
-        buf += chunk
-
-
-def expect(sock, seconds, pred, label):
-    last = None
-    for rows in frames(sock, time.time() + seconds):
-        last = rows
-        if pred(rows):
-            print("e2e-m3: ok - %s" % label)
-            return last
+        grid.feed(chunk)
+    if pred(grid):
+        print("e2e-m3: ok - %s" % label)
+        return
     print("e2e-m3: FAIL - %s; last screen:" % label, file=sys.stderr)
-    for r in (last or []):
-        sys.stderr.write("  |%s|\n" % r.rstrip())
+    for r in grid.text().splitlines():
+        if r.strip():
+            sys.stderr.write("  |%s|\n" % r)
     sys.exit(1)
+
+
+def rows(grid):
+    return grid.text().splitlines()
 
 
 def main():
@@ -97,12 +82,10 @@ def main():
     try:
         for _ in range(600):
             if qemu.poll() is not None:
-                print("e2e-m3: FAIL - qemu-run.sh exited early",
-                      file=sys.stderr)
+                print("e2e-m3: FAIL - qemu-run.sh exited early", file=sys.stderr)
                 return 1
             try:
-                sock = socket.create_connection(("127.0.0.1", PORT),
-                                                timeout=1)
+                sock = socket.create_connection(("127.0.0.1", PORT), timeout=1)
                 break
             except OSError:
                 time.sleep(0.5)
@@ -110,37 +93,43 @@ def main():
             print("e2e-m3: FAIL - serial port never opened", file=sys.stderr)
             return 1
 
-        expect(sock, BOOT_TIMEOUT, lambda rows: True, "mirror up")
-        expect(sock, STEP_TIMEOUT,
-               lambda rows: any(":\\>" in r for r in rows),
+        grid = AnsiGrid()
+        expect(sock, grid, BOOT_TIMEOUT,
+               lambda g: any(":\\>" in r for r in rows(g)),
                "primary shell prompt after DOSSHD went resident")
         time.sleep(1.0)
 
-        type_line(sock, "echo BANANA\r")
-        expect(sock, STEP_TIMEOUT,
-               lambda rows: any(r.startswith("BANANA") for r in rows),
+        type_text(sock, "echo BANANA\r")
+        expect(sock, grid, STEP_TIMEOUT,
+               lambda g: any(r.lstrip().startswith("BANANA") for r in rows(g)),
                "keys reach the primary shell")
 
-        type_line(sock, "vidtest\r")
-        expect(sock, STEP_TIMEOUT,
-               lambda rows: any("VIDTEST:" in r for r in rows),
+        type_text(sock, "vidtest\r")
+        expect(sock, grid, STEP_TIMEOUT,
+               lambda g: any("VIDTEST:" in r for r in rows(g)),
                "direct-video program mirrored while TSR in background")
 
-        type_line(sock, "x")
-        expect(sock, STEP_TIMEOUT,
-               lambda rows: any("KEY: x" in r for r in rows),
+        type_text(sock, "x")
+        expect(sock, grid, STEP_TIMEOUT,
+               lambda g: any("KEY: x" in r for r in rows(g)),
                "keys reach a program reading INT 16h")
 
-        type_line(sock, "q")
+        type_text(sock, "q")
         time.sleep(0.5)
-        type_line(sock, "echo AFTERTEST\r")
-        expect(sock, STEP_TIMEOUT,
-               lambda rows: any(r.startswith("AFTERTEST") for r in rows),
+        type_text(sock, "echo AFTERTEST\r")
+        expect(sock, grid, STEP_TIMEOUT,
+               lambda g: any(r.lstrip().startswith("AFTERTEST") for r in rows(g)),
                "shell alive after the program exits")
 
-        type_line(sock, "dosshd /u\r")
-        for _ in frames(sock, time.time() + 6):   # drain the tail
-            pass
+        type_text(sock, "dosshd /u\r")
+        end = time.time() + 6                     # drain the uninstall tail
+        while time.time() < end:
+            sock.settimeout(max(0.1, end - time.time()))
+            try:
+                if not sock.recv(65536):
+                    break
+            except socket.timeout:
+                break
         sock.settimeout(SILENCE_SECS)
         try:
             data = sock.recv(4096)
