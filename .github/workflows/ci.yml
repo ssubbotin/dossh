@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck (build + test scripts)
         run: shellcheck dosshd/build.sh test/qemu-run.sh test/run-tests.sh
-      - name: ruff (python tests: syntax + real errors)
+      - name: ruff (python tests - syntax + real errors)
         run: pipx run ruff check --select E9,F test/
 
   build-test:
