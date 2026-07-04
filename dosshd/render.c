@@ -72,7 +72,9 @@ static void e_sgr( unsigned char attr )
     static const unsigned char v2a[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
     unsigned fg = attr & 0x0F, bg = (attr >> 4) & 0x07;
     unsigned fgc = fg < 8 ? 30 + v2a[fg] : 90 + v2a[fg - 8];
-    e_s( "\x1b[0;" ); e_num( fgc ); e_b( ';' ); e_num( 40 + v2a[bg] ); e_b( 'm' );
+    e_s( "\x1b[0;" ); e_num( fgc ); e_b( ';' ); e_num( 40 + v2a[bg] );
+    if( attr & 0x80 ) e_s( ";5" );       /* VGA blink bit -> SGR blink */
+    e_b( 'm' );
 }
 static void e_char( unsigned char ch )
 {
@@ -123,6 +125,12 @@ static void frame_decide( int serial )
     else if( !repaint && serial && (long)( ticks() - last_kf ) >= CADENCE_TICKS )
         repaint = 1;
 
+    /* large modes have no shadow to diff against (bytes > SHADOW_BYTES); between
+       cadence repaints there is nothing to send - and diffing here would read
+       past the 4000-byte shadow. */
+    if( is_toobig && !repaint )
+        return;
+
     if( !repaint ) {                 /* diff: is anything worth sending? */
         for( c = 0; c < bytes; c += 2 )
             if( v[c] != shadow[c] || v[c + 1] != shadow[c + 1] ) changed++;
@@ -154,7 +162,7 @@ static void frame_fill( void )
         unsigned idx = c * 2;
         unsigned char ch, at;
         int changed;
-        /* reserve room for one worst-case cell (~21B) AND the frame tail
+        /* reserve room for one worst-case cell (~24B) AND the frame tail
            (park cursor + show, ~20B) so completion is never truncated */
         if( o_len + 48 > OBUF ) break;
         ch = v[idx]; at = v[idx + 1];

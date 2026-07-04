@@ -14,10 +14,15 @@ IAC = 0xFF
 
 
 class AnsiGrid:
+    DEFAULT_ATTR = (37, 40, False)      # fg code, bg code, blink
+
     def __init__(self, cols=80, rows=25):
         self.cols = cols
         self.rows = rows
         self.grid = [[" "] * cols for _ in range(rows)]
+        # per-cell (fg, bg, blink) captured from SGR, so tests can verify colour
+        self.attr = [[self.DEFAULT_ATTR] * cols for _ in range(rows)]
+        self.cur = self.DEFAULT_ATTR
         self.cx = 0
         self.cy = 0
         self.buf = bytearray()      # pending bytes (incomplete seq / UTF-8)
@@ -34,14 +39,22 @@ class AnsiGrid:
     def _put(self, ch):
         if self.cy < self.rows and self.cx < self.cols:
             self.grid[self.cy][self.cx] = ch
+            self.attr[self.cy][self.cx] = self.cur
         self.cx += 1
         if self.cx >= self.cols:      # let CUP move us; don't autowrap grid state
             self.cx = self.cols - 1
+
+    def attr_at(self, y, x):
+        """(fg, bg, blink) at a cell, e.g. (97, 41, False) = bright-white on red."""
+        return self.attr[y][x]
 
     def _clear(self):
         for r in self.grid:
             for i in range(self.cols):
                 r[i] = " "
+        for r in self.attr:
+            for i in range(self.cols):
+                r[i] = self.DEFAULT_ATTR
 
     def feed(self, data):
         self.buf += data
@@ -116,4 +129,19 @@ class AnsiGrid:
             if self.cy < self.rows:
                 for x in range(self.cx, self.cols):
                     self.grid[self.cy][x] = " "
-        # SGR ('m'), cursor show/hide ('h'/'l'), etc.: no effect on text content
+        elif final == "m":                      # SGR: track fg/bg/blink
+            fg, bg, blink = self.cur
+            for p in (params or "0").split(";"):
+                n = int(p) if p else 0
+                if n == 0:
+                    fg, bg, blink = self.DEFAULT_ATTR
+                elif n == 5:
+                    blink = True
+                elif n == 25:
+                    blink = False
+                elif 30 <= n <= 37 or 90 <= n <= 97:
+                    fg = n
+                elif 40 <= n <= 47 or 100 <= n <= 107:
+                    bg = n
+            self.cur = (fg, bg, blink)
+        # cursor show/hide ('h'/'l'), etc.: no effect on text content

@@ -333,3 +333,42 @@ decoder):
 
 **Decisions (resolved):** telnet-only (retire the binary protocol + client);
 CP437→UTF-8 default + `/CP437RAW`; 4 KB shadow (diff 80×25, larger modes repaint).
+
+### 14.1 As shipped, and M5.1 hardening
+
+Deltas from the spec above, so the doc matches the code:
+
+- **Coalescing not implemented.** The emitter suppresses a `CUP` only for
+  strictly adjacent changed cells; the "≤3-cell-apart spans are coalesced"
+  optimisation (line 291) was dropped as YAGNI. Correct output, slightly more
+  `CUP`s. A future bandwidth tweak, not a defect.
+- **`/CP437RAW` deferred.** Only the CP437→UTF-8 path shipped. The raw-byte
+  opt-out (and its outbound telnet `0xFF`-doubling) is unbuilt; UTF-8 never
+  emits `0xFF`, so no escaping is needed today.
+- **Blink shipped in M5.1.** `e_sgr` now emits `SGR 5` when the VGA blink bit
+  (attr bit 7) is set. Caveat: if the box has the attribute controller in
+  bright-background mode (blink disabled), bit 7 means bright bg, not blink —
+  undetectable from the BDA, so we render the DOS default (blink).
+
+**M5.1 — robustness fixes for real-hardware deployment** (the console targets a
+flaky VPN link; `net.c`):
+
+- **Reconnect lockout fixed.** An unclean client drop (no FIN/RST) previously
+  pinned the connection in `ESTAB` forever, so a reconnecting client's `SYN`
+  was dropped by the peer filter — unreachable until reinstall. Now a `SYN`
+  **from the peer's host** (gated on source IP, so a stray/scanner `SYN` can't
+  kill a live session) arriving in `ESTAB` re-`LISTEN`s and serves the new
+  client, and the retransmit loop is capped (`MAX_REXMIT` ≈ 13 s of no ACK →
+  back to `LISTEN`), so a dead peer with unacked data frees itself. Proven by
+  `e2e-m5d-reconnect`. Known tradeoffs (acceptable for a single-admin console):
+  a client reconnecting from a *different* IP waits out the retransmit cap
+  first, and the retransmit cap can drop a peer that legitimately zero-windows
+  for >13 s (an interactive client never does).
+- **Receive-ring flow control fixed.** The advertised TCP window now reflects
+  the real free space in the 512-byte ring, and on overflow `rcv_nxt` advances
+  only by bytes actually stored — so overrun keystrokes are retransmitted, not
+  silently ACKed and lost.
+- **Large-mode OOB read fixed.** The `>80×25` (`is_toobig`) path no longer
+  enters the diff loop that would index past the 4000-byte shadow.
+- **`udp_echo` removed.** The M4 bring-up UDP reflector is gone (it was an
+  unauthenticated reflection surface, unused by the console).

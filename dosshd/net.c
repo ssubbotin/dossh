@@ -28,7 +28,7 @@
 /* ---- identity + counters --------------------------------------------- */
 unsigned char g_mac[6];
 unsigned char g_ip[4];
-unsigned long g_rx_frames, g_arp_replies, g_udp_echoes, g_tcp_segs;
+unsigned long g_rx_frames, g_arp_replies, g_tcp_segs;
 
 static unsigned char pkt_int;      /* packet-driver software interrupt */
 static unsigned      pkt_handle;
@@ -162,7 +162,6 @@ static unsigned fin16( unsigned long sum )
 #define IP_OFF   ETH_HLEN
 #define ET_ARP   0x0806
 #define ET_IP    0x0800
-#define IPP_UDP  17
 #define IPP_TCP  6
 
 /* ---- Ethernet / IP transmit ------------------------------------------ */
@@ -249,6 +248,9 @@ static unsigned      s_una, s_nxt, s_end;
 static unsigned char rbuf[RCV_SZ];
 static unsigned      r_head, r_tail;
 static unsigned long rexmit_at;
+static unsigned      rexmit_count;     /* consecutive retransmits w/o progress */
+
+#define MAX_REXMIT 24          /* ~13s of no ACK -> peer is dead, re-LISTEN */
 
 static unsigned long ticks( void )
 {
@@ -260,6 +262,7 @@ static void tcp_reset_listen( void )
     tstate = TS_LISTEN;
     s_una = s_nxt = s_end = 0;
     r_head = r_tail = 0;
+    rexmit_count = 0;
 }
 
 /* send one TCP segment: flags, seq/ack from state, optional MSS option,
@@ -278,7 +281,8 @@ static void tcp_send_seg( unsigned char flags, int with_mss,
     wr32( seg + 8, rcv_nxt );
     seg[12] = (unsigned char)((hlen / 4) << 4);
     seg[13] = flags;
-    wr16( seg + 14, RCV_SZ - 1 );   /* advertised window */
+    /* advertise the real free space so the peer never overruns the ring */
+    wr16( seg + 14, (RCV_SZ - 1) - ((r_head - r_tail) & RCV_MASK) );
     seg[16] = seg[17] = 0;          /* checksum (filled below) */
     seg[18] = seg[19] = 0;          /* urgent */
     if( with_mss ) {
@@ -344,6 +348,14 @@ static void tcp_in( unsigned char *f, unsigned n )
         return;
     }
 
+    /* A SYN from our peer's host while we are ESTABlished means the old client
+       is gone (an unclean drop leaves no FIN/RST) and it is reconnecting from a
+       new ephemeral port - drop the stale peer and set the new connection up
+       below. Gated on source IP so a stray/scanner SYN can't kill the session. */
+    if( (flags & 0x02) && tstate == TS_ESTAB
+                       && memcmp( ip + 12, peer_ip, 4 ) == 0 )
+        tcp_reset_listen();
+
     if( tstate == TS_LISTEN ) {
         if( !(flags & 0x02) )                  /* want SYN */
             return;
@@ -369,6 +381,7 @@ static void tcp_in( unsigned char *f, unsigned n )
         if( (flags & 0x10) && ack == snd_nxt ) {   /* ACK of our SYN */
             snd_una = ack;
             tstate = TS_ESTAB;
+            rexmit_count = 0;                  /* fresh budget for the first data */
         } else
             return;
     }
@@ -382,20 +395,22 @@ static void tcp_in( unsigned char *f, unsigned n )
             s_una = (s_una + freed) & SND_MASK;
             snd_una = ack;
             rexmit_at = ticks() + REXMIT_TICKS;
+            rexmit_count = 0;                  /* peer is alive and making progress */
         }
     }
 
     if( dlen ) {
         if( seq == rcv_nxt ) {                 /* in-order data: keys */
-            unsigned i;
+            unsigned i, stored = 0;
             for( i = 0; i < dlen; i++ ) {
                 unsigned nh = (r_head + 1) & RCV_MASK;
-                if( nh != r_tail ) {
-                    rbuf[r_head] = t[toff + i];
-                    r_head = nh;
-                }
+                if( nh == r_tail )             /* ring full: keep the rest */
+                    break;                     /* ... unacked, so it retransmits */
+                rbuf[r_head] = t[toff + i];
+                r_head = nh;
+                stored++;
             }
-            rcv_nxt += dlen;
+            rcv_nxt += stored;                 /* only ack bytes we actually kept */
         }
         tcp_send_seg( 0x10, 0, 0, 0 );         /* ACK (also re-ACKs on gap) */
     }
@@ -412,6 +427,10 @@ static void tcp_timer( void )
     if( tstate < TS_SYNRCVD )
         return;
     if( (long)(snd_nxt - snd_una) > 0 && (long)(ticks() - rexmit_at) >= 0 ) {
+        if( ++rexmit_count > MAX_REXMIT ) {    /* peer stopped ACKing: give up */
+            tcp_reset_listen();                /* ... and free up for a reconnect */
+            return;
+        }
         /* go-back-N: resend from the oldest unacked byte */
         s_nxt = s_una;
         snd_nxt = snd_una;
@@ -422,25 +441,6 @@ static void tcp_timer( void )
 }
 
 /* ---- IP dispatch + poll ---------------------------------------------- */
-
-static void udp_echo( unsigned char *f, unsigned n )
-{
-    unsigned char *ip = f + IP_OFF;
-    unsigned ihl = (ip[0] & 0x0F) * 4;
-    unsigned char *u = ip + ihl;
-    unsigned ulen = rd16( u + 4 );
-    static unsigned char reply[1500];    /* static: runs in the ISR (SS != DS) */
-    static unsigned char sip[4];
-
-    if( ulen < 8 || ulen > sizeof( reply ) ) return;
-    memcpy( sip, ip + 12, 4 );
-    memcpy( reply, u, ulen );
-    wr16( reply + 0, rd16( u + 2 ) );      /* dst port <- src port */
-    wr16( reply + 2, rd16( u + 0 ) );      /* src port <- dst port */
-    reply[6] = reply[7] = 0;               /* zero udp checksum (optional) */
-    ip_send( IPP_UDP, f + 6, sip, reply, ulen );
-    g_udp_echoes++;
-}
 
 static void handle_frame( unsigned char *f, unsigned n )
 {
@@ -457,9 +457,7 @@ static void handle_frame( unsigned char *f, unsigned n )
     if( (f[IP_OFF] >> 4) != 4 ) return;        /* IPv4 */
     if( memcmp( f + IP_OFF + 16, g_ip, 4 ) != 0 ) return;   /* to us */
 
-    if( f[IP_OFF + 9] == IPP_UDP )
-        udp_echo( f, n );
-    else if( f[IP_OFF + 9] == IPP_TCP )
+    if( f[IP_OFF + 9] == IPP_TCP )
         tcp_in( f, n );
 }
 

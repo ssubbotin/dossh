@@ -14,10 +14,9 @@
 extern unsigned char g_mac[6];
 extern unsigned char g_ip[4];
 
-/* observability counters (used by the bring-up probe) */
+/* observability counters */
 extern unsigned long g_rx_frames;
 extern unsigned long g_arp_replies;
-extern unsigned long g_udp_echoes;
 extern unsigned long g_tcp_segs;
 
 /* bring the stack up: find the packet driver, register a receiver, learn our

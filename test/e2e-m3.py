@@ -109,6 +109,22 @@ def main():
                lambda g: any("VIDTEST:" in r for r in rows(g)),
                "direct-video program mirrored while TSR in background")
 
+        # colour fidelity: VIDTEST paints its banner white-on-red (VGA 0x4F),
+        # which the renderer must emit as SGR 97;41 - the ANSI decoder captures
+        # it so we can assert the colour, not just the text.
+        banner = None
+        for y, line in enumerate(rows(grid)):
+            x = line.find("VIDTEST:")
+            if x >= 0:
+                banner = grid.attr_at(y, x)
+                break
+        if banner == (97, 41, False):
+            print("e2e-m3: ok - SGR colour correct (white-on-red banner)")
+        else:
+            print("e2e-m3: FAIL - VIDTEST banner colour = %r, want (97,41,False)"
+                  % (banner,), file=sys.stderr)
+            return 1
+
         type_text(sock, "x")
         expect(sock, grid, STEP_TIMEOUT,
                lambda g: any("KEY: x" in r for r in rows(g)),
