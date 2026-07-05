@@ -26,6 +26,15 @@ cc -O2 -DDOSSH_SSH_SUBSET -Idosshd/crypto -o "$CBIN" \
     dosshd/crypto/monocypher.c dosshd/crypto/monocypher-ed25519.c
 "$CBIN"
 
+echo "== unit: RNG DRBG KAT + distribution (test_rng.c) =="
+RBIN="${TMPDIR:-/tmp}/dossh-test-rng"
+# Same rng.c + crypto the DOS build links; -DDOSSH_RNG_TEST enables the
+# deterministic fixed-seed hook the DRBG known-answer test needs.
+cc -O2 -DDOSSH_SSH_SUBSET -DDOSSH_RNG_TEST -Idosshd/crypto -o "$RBIN" \
+    test/test_rng.c dosshd/crypto/rng.c dosshd/crypto/crypto.c dosshd/crypto/sha256.c \
+    dosshd/crypto/monocypher.c dosshd/crypto/monocypher-ed25519.c
+"$RBIN"
+
 [ "$1" = "unit" ] && { echo "== unit tests passed =="; exit 0; }
 
 echo "== e2e (QEMU, sequential) =="

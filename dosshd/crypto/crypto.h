@@ -85,6 +85,17 @@ int DOSSH_FAR dossh_aead_unlock(uint8_t *plain, const uint8_t mac[16],
                                 const uint8_t *ad, size_t ad_len,
                                 const uint8_t *cipher, size_t cipher_len);
 
+/* ---- Raw ChaCha20 keystream (RFC 8439 IETF) ------------------------ */
+/*
+ * Writes n bytes of the ChaCha20 keystream (i.e. the cipher of an all-zero
+ * plaintext) to out, for the given 256-bit key, 96-bit nonce and 32-bit
+ * starting block counter. This is the unauthenticated stream primitive; the
+ * SSH record layer uses the AEAD above, but the CSPRNG (rng.c) needs bare
+ * keystream to drive a ChaCha20 DRBG. */
+void DOSSH_FAR dossh_chacha20(uint8_t *out, const uint8_t key[32],
+                              const uint8_t nonce[12], uint32_t counter,
+                              size_t n);
+
 /* ---- Hashes -------------------------------------------------------- */
 
 void DOSSH_FAR dossh_sha256(uint8_t hash[32], const uint8_t *msg, size_t msg_len);

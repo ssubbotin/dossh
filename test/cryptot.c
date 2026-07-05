@@ -7,7 +7,8 @@
  * compile AND link clean on the DOS target. The full vector suite runs
  * natively in test/test_crypto.c; this is just the on-target link/smoke proof.
  *
- * SSH-era feature: requires a 386 or better (the crypto is compiled -3).
+ * SSH-era feature: requires a 386 or better (the crypto is compiled -3), and a
+ * 586 or better once the RNG smoke runs (RDTSC).
  *
  * Build: see dosshd/build.sh.  MIT License. Copyright (c) 2026 Sergey Subbotin.
  */
@@ -15,6 +16,7 @@
 #include <string.h>
 
 #include "crypto.h"
+#include "rng.h"
 
 static int fails = 0;
 
@@ -58,6 +60,24 @@ int main(void)
 
 	dossh_x25519(out, k, u);
 	check("X25519 RFC 7748 5.2", out, x_exp, 32);
+
+	/* RNG smoke: gather DOS entropy, seed the ChaCha20 DRBG, draw two blocks
+	 * and confirm they are neither all-zero nor equal - proves rng.c compiled
+	 * -3/-mm links and runs on target (RDTSC needs a 586+). */
+	{
+		unsigned char r1[32], r2[32];
+		int i, allzero = 1, equal;
+		rng_init();
+		rng_bytes(r1, sizeof(r1));
+		rng_bytes(r2, sizeof(r2));
+		for (i = 0; i < 32; i++)
+			if (r1[i]) { allzero = 0; break; }
+		equal = (memcmp(r1, r2, 32) == 0);
+		if (allzero || equal)
+			fails++;
+		printf("  [%s] RNG draws are nonzero and distinct\n",
+		       (!allzero && !equal) ? "PASS" : "FAIL");
+	}
 
 	if (fails) {
 		printf("%d self-test(s) FAILED\n", fails);

@@ -64,6 +64,13 @@ int DOSSH_FAR dossh_aead_unlock(uint8_t *plain, const uint8_t mac[16],
 	return r;
 }
 
+void DOSSH_FAR dossh_chacha20(uint8_t *out, const uint8_t key[32],
+                    const uint8_t nonce[12], uint32_t counter, size_t n)
+{
+	/* plain_text == NULL makes Monocypher emit raw keystream. */
+	crypto_chacha20_ietf(out, (const uint8_t *)0, n, key, nonce, counter);
+}
+
 void DOSSH_FAR dossh_sha256(uint8_t hash[32], const uint8_t *msg, size_t msg_len)
 {
 	sha256(hash, msg, msg_len);

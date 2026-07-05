@@ -54,7 +54,10 @@ cp -f dosshd.exe DOSSHD.EXE 2>/dev/null || true
 # (Argon2, EdDSA<->X25519 conversions, "dirty" keys, Elligator 2, scalar
 # division) to keep each module under the 64K per-segment limit. The native
 # KAT build (test/run-tests.sh) defines the same macro so both agree.
-CRYPTO_SRC="crypto/monocypher.c crypto/monocypher-ed25519.c crypto/sha256.c crypto/crypto.c"
+# rng.c (the DOS entropy pool + ChaCha20 DRBG for SSH key generation) builds
+# with the exact same -mm -3 recipe because it far-calls the crypto (SHA-256,
+# ChaCha20). It needs a 586+ (RDTSC) on top of the crypto's 386+ requirement.
+CRYPTO_SRC="crypto/monocypher.c crypto/monocypher-ed25519.c crypto/sha256.c crypto/crypto.c crypto/rng.c"
 CRYPTO_OBJ=""
 for f in $CRYPTO_SRC; do
     o="${f%.c}.o"
