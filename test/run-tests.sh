@@ -18,7 +18,9 @@ echo "== build DOSSHD =="
 if [ "$1" = "ssh" ]; then
     echo "== ssh transport interop (real OpenSSH client) =="
     bash test/e2e-ssh-transport.sh
-    echo "== ssh transport target passed =="
+    echo "== ssh userauth + session-channel interop (real OpenSSH client) =="
+    bash test/e2e-ssh-shell.sh
+    echo "== ssh targets passed =="
     exit 0
 fi
 
@@ -58,9 +60,12 @@ done
 echo "== net-smoke (opt-in via DOSSH_DRIVERS) =="
 bash test/net-smoke.sh || { echo "FAILED: net-smoke"; exit 1; }
 
-# SSH transport interop against a real OpenSSH client (self-skips if `ssh` is
+# SSH interop against a real OpenSSH client (self-skips if `ssh`/`sshpass` are
 # absent). Needs cc + ssh, not QEMU, so it runs in the default sweep too.
 echo "== ssh transport interop (real OpenSSH client) =="
 bash test/e2e-ssh-transport.sh || { echo "FAILED: ssh transport interop"; exit 1; }
+
+echo "== ssh userauth + session-channel interop (real OpenSSH client) =="
+bash test/e2e-ssh-shell.sh || { echo "FAILED: ssh userauth+channel interop"; exit 1; }
 
 echo "== all tests passed =="

@@ -23,7 +23,7 @@
 #define SERVER_ID       "SSH-2.0-DOSSH_0.9"
 #define SERVER_ID_CRLF  "SSH-2.0-DOSSH_0.9\r\n"
 
-/* SSH message numbers (RFC 4253 sec 12, RFC 5656). */
+/* SSH message numbers (RFC 4253 sec 12, RFC 5656, RFC 4252, RFC 4254). */
 #define MSG_DISCONNECT       1
 #define MSG_IGNORE           2
 #define MSG_UNIMPLEMENTED    3
@@ -34,6 +34,32 @@
 #define MSG_NEWKEYS         21
 #define MSG_KEX_ECDH_INIT   30
 #define MSG_KEX_ECDH_REPLY  31
+/* userauth (RFC 4252) */
+#define MSG_USERAUTH_REQUEST 50
+#define MSG_USERAUTH_FAILURE 51
+#define MSG_USERAUTH_SUCCESS 52
+#define MSG_USERAUTH_BANNER  53
+/* connection protocol (RFC 4254) */
+#define MSG_GLOBAL_REQUEST           80
+#define MSG_REQUEST_SUCCESS          81
+#define MSG_REQUEST_FAILURE          82
+#define MSG_CHANNEL_OPEN             90
+#define MSG_CHANNEL_OPEN_CONFIRMATION 91
+#define MSG_CHANNEL_OPEN_FAILURE     92
+#define MSG_CHANNEL_WINDOW_ADJUST    93
+#define MSG_CHANNEL_DATA             94
+#define MSG_CHANNEL_EXTENDED_DATA    95
+#define MSG_CHANNEL_EOF              96
+#define MSG_CHANNEL_CLOSE            97
+#define MSG_CHANNEL_REQUEST          98
+#define MSG_CHANNEL_SUCCESS          99
+#define MSG_CHANNEL_FAILURE         100
+
+/* SSH_MSG_DISCONNECT reason code used when auth is exhausted (RFC 4253 sec 11). */
+#define DISCONNECT_NO_MORE_AUTH      14
+/* SSH_MSG_CHANNEL_OPEN_FAILURE reason codes (RFC 4254 sec 5.1). */
+#define OPEN_ADMINISTRATIVELY_PROHIBITED 1
+#define OPEN_UNKNOWN_CHANNEL_TYPE        3
 
 /*
  * Transient scratch for the exchange-hash preimage and the KDF. It is written
@@ -430,15 +456,243 @@ static void handle_service_request(ssh_conn *c, const uint8_t *pl, unsigned plen
 	}
 	memcpy(c->svc_name, pl + 5, slen);
 	c->svc_name[slen] = 0;
-	c->done = 1;
+	c->done = 1;                 /* latched: SERVICE_REQUEST decrypted           */
 
-	/* optional courtesy reply (also proves our encrypt path): SERVICE_ACCEPT */
+	/* SERVICE_ACCEPT echoes the requested service (RFC 4253 sec 10). */
 	o = 0;
 	accept[o++] = MSG_SERVICE_ACCEPT;
 	o += put_str(accept + o, (const uint8_t *)c->svc_name, slen);
 	send_packet(c, accept, o);
 
-	c->state = SSH_ST_DONE;
+	c->state = SSH_ST_AUTH;      /* now run userauth on top of the transport     */
+}
+
+/* ---- userauth (RFC 4252) ------------------------------------------- */
+
+static void send_userauth_failure(ssh_conn *c)
+{
+	uint8_t rep[40];
+	unsigned o = 0;
+	rep[o++] = MSG_USERAUTH_FAILURE;
+	o += put_nl(rep + o, "password");   /* methods that can still continue */
+	rep[o++] = 0;                       /* partial success = FALSE          */
+	send_packet(c, rep, o);
+}
+
+static void send_userauth_success(ssh_conn *c)
+{
+	uint8_t m = MSG_USERAUTH_SUCCESS;
+	send_packet(c, &m, 1);
+	c->authenticated = 1;
+	c->state = SSH_ST_SESSION;
+}
+
+static void send_disconnect(ssh_conn *c, uint32_t reason, const char *desc)
+{
+	uint8_t rep[96];
+	unsigned o = 0;
+	rep[o++] = MSG_DISCONNECT;
+	put_u32(rep + o, reason); o += 4;
+	o += put_nl(rep + o, desc);
+	o += put_nl(rep + o, "");           /* language tag */
+	send_packet(c, rep, o);
+	c->state = SSH_ST_CLOSED;
+}
+
+static void auth_reject(ssh_conn *c, int count_it)
+{
+	if (count_it) c->auth_fails++;
+	if (c->auth_fails >= SSH_MAX_AUTH_TRIES)
+		send_disconnect(c, DISCONNECT_NO_MORE_AUTH,
+		                "too many authentication failures");
+	else
+		send_userauth_failure(c);
+}
+
+static void handle_userauth_request(ssh_conn *c, const uint8_t *pl, unsigned plen)
+{
+	unsigned o = 1, ulen, slen, mlen, k;
+	const uint8_t *user, *method;
+
+	if (o + 4 > plen) { fail(c, "short USERAUTH_REQUEST"); return; }
+	ulen = rd_u32(pl + o); o += 4; user = pl + o; o += ulen;
+	if (o + 4 > plen) { fail(c, "bad USERAUTH_REQUEST"); return; }
+	slen = rd_u32(pl + o); o += 4; o += slen;            /* service name (skip) */
+	if (o + 4 > plen) { fail(c, "bad USERAUTH_REQUEST"); return; }
+	mlen = rd_u32(pl + o); o += 4; method = pl + o; o += mlen;
+	if (o > plen) { fail(c, "bad USERAUTH_REQUEST"); return; }
+
+	k = ulen < sizeof(c->auth_user) - 1 ? ulen : sizeof(c->auth_user) - 1;
+	memcpy(c->auth_user, user, k); c->auth_user[k] = 0;
+
+	/* Open box (no /P equivalent): admit the first attempt, any method. */
+	if (!c->have_password) { send_userauth_success(c); return; }
+
+	if (mlen == 8 && memcmp(method, "password", 8) == 0) {
+		unsigned pwlen, want;
+		const uint8_t *pw;
+		if (o + 1 > plen) { auth_reject(c, 1); return; }
+		if (pl[o++]) { auth_reject(c, 1); return; }  /* change-password: no */
+		if (o + 4 > plen) { auth_reject(c, 1); return; }
+		pwlen = rd_u32(pl + o); o += 4; pw = pl + o;
+		if (o + pwlen > plen) { auth_reject(c, 1); return; }
+		want = (unsigned)strlen(c->password);
+		if (pwlen == want && memcmp(pw, c->password, want) == 0)
+			send_userauth_success(c);
+		else
+			auth_reject(c, 1);
+		return;
+	}
+
+	/* "none" is the client's probe for the method list - don't spend the retry
+	 * budget on it; publickey/other do count (publickey is P2, refuse to pw). */
+	auth_reject(c, !(mlen == 4 && memcmp(method, "none", 4) == 0));
+}
+
+/* ---- connection layer (RFC 4254) ----------------------------------- */
+
+static void chan_reply(ssh_conn *c, uint8_t type)   /* SUCCESS/FAILURE */
+{
+	uint8_t rep[8];
+	rep[0] = type;
+	put_u32(rep + 1, c->peer_chan);
+	send_packet(c, rep, 5);
+}
+
+static void handle_channel_open(ssh_conn *c, const uint8_t *pl, unsigned plen)
+{
+	unsigned o = 1, tlen;
+	const uint8_t *tname;
+	uint32_t sender, iwin, maxp;
+	uint8_t rep[64];
+	unsigned ro;
+
+	if (o + 4 > plen) { fail(c, "short CHANNEL_OPEN"); return; }
+	tlen = rd_u32(pl + o); o += 4; tname = pl + o; o += tlen;
+	if (o + 12 > plen) { fail(c, "bad CHANNEL_OPEN"); return; }
+	sender = rd_u32(pl + o); o += 4;
+	iwin   = rd_u32(pl + o); o += 4;
+	maxp   = rd_u32(pl + o); o += 4;
+
+	if (c->chan_open || tlen != 7 || memcmp(tname, "session", 7) != 0) {
+		ro = 0;
+		rep[ro++] = MSG_CHANNEL_OPEN_FAILURE;
+		put_u32(rep + ro, sender); ro += 4;
+		put_u32(rep + ro, c->chan_open ? OPEN_ADMINISTRATIVELY_PROHIBITED
+		                               : OPEN_UNKNOWN_CHANNEL_TYPE); ro += 4;
+		ro += put_nl(rep + ro, "only one session channel");
+		ro += put_nl(rep + ro, "");
+		send_packet(c, rep, ro);
+		return;
+	}
+
+	c->peer_chan     = sender;
+	c->peer_window   = iwin;
+	c->peer_maxpkt   = maxp;
+	c->local_chan    = 0;
+	c->local_window  = SSH_LOCAL_WINDOW;
+	c->chan_open     = 1;
+
+	ro = 0;
+	rep[ro++] = MSG_CHANNEL_OPEN_CONFIRMATION;
+	put_u32(rep + ro, sender);           ro += 4;   /* recipient (their id)  */
+	put_u32(rep + ro, c->local_chan);    ro += 4;   /* our sender id          */
+	put_u32(rep + ro, c->local_window);  ro += 4;   /* our initial window     */
+	put_u32(rep + ro, SSH_CHAN_MAXPKT);  ro += 4;   /* our max packet size    */
+	send_packet(c, rep, ro);
+}
+
+static void handle_channel_request(ssh_conn *c, const uint8_t *pl, unsigned plen)
+{
+	unsigned o = 1, rtlen;
+	const uint8_t *rtype;
+	int want_reply, granted = 0;
+
+	if (o + 4 > plen) return;
+	o += 4;                                        /* recipient channel (ours) */
+	if (o + 4 > plen) return;
+	rtlen = rd_u32(pl + o); o += 4; rtype = pl + o; o += rtlen;
+	if (o + 1 > plen) return;
+	want_reply = pl[o++];
+
+	if (rtlen == 7 && memcmp(rtype, "pty-req", 7) == 0) {
+		unsigned tl;                               /* TERM string, then WxH */
+		if (o + 4 <= plen) {
+			tl = rd_u32(pl + o); o += 4 + tl;
+			if (o + 8 <= plen) {
+				c->term_cols = rd_u32(pl + o);
+				c->term_rows = rd_u32(pl + o + 4);
+			}
+		}
+		c->pty = 1;
+		granted = 1;
+	} else if ((rtlen == 5 && memcmp(rtype, "shell", 5) == 0) ||
+	           (rtlen == 4 && memcmp(rtype, "exec", 4) == 0)) {
+		c->shell_ready = 1;                        /* channel is now a byte pipe */
+		granted = 1;
+	} else if (rtlen == 13 && memcmp(rtype, "window-change", 13) == 0) {
+		if (o + 8 <= plen) {
+			c->term_cols = rd_u32(pl + o);
+			c->term_rows = rd_u32(pl + o + 4);
+		}
+		granted = 1;                               /* want_reply is always 0 */
+	} else {
+		granted = 0;                               /* env / signal / unknown */
+	}
+
+	if (want_reply)
+		chan_reply(c, granted ? MSG_CHANNEL_SUCCESS : MSG_CHANNEL_FAILURE);
+}
+
+static void adjust_local_window(ssh_conn *c, unsigned consumed)
+{
+	uint8_t adj[9];
+	unsigned o, add;
+
+	if (c->local_window >= consumed) c->local_window -= consumed;
+	else                             c->local_window = 0;
+	if (c->local_window >= SSH_LOCAL_WINDOW / 2) return;
+
+	add = SSH_LOCAL_WINDOW - c->local_window;
+	o = 0;
+	adj[o++] = MSG_CHANNEL_WINDOW_ADJUST;
+	put_u32(adj + o, c->peer_chan); o += 4;
+	put_u32(adj + o, add);          o += 4;
+	send_packet(c, adj, o);
+	c->local_window += add;
+}
+
+static void handle_channel_data(ssh_conn *c, const uint8_t *pl, unsigned plen)
+{
+	unsigned dlen, i;
+
+	if (plen < 9) return;                          /* msg + chan(4) + len(4) */
+	dlen = rd_u32(pl + 5);
+	if (9 + dlen > plen) dlen = plen - 9;          /* clamp to what arrived  */
+	for (i = 0; i < dlen; i++) {
+		unsigned next = (c->cin_tail + 1) % SSH_CIN_SZ;
+		if (next == c->cin_head) break;            /* ring full: drop the rest */
+		c->cin[c->cin_tail] = pl[9 + i];
+		c->cin_tail = next;
+	}
+	adjust_local_window(c, dlen);
+}
+
+static void handle_channel_window_adjust(ssh_conn *c, const uint8_t *pl, unsigned plen)
+{
+	if (plen < 9) return;
+	c->peer_window += rd_u32(pl + 5);
+}
+
+static void handle_global_request(ssh_conn *c, const uint8_t *pl, unsigned plen)
+{
+	unsigned o = 1, nlen;
+	if (o + 4 > plen) return;
+	nlen = rd_u32(pl + o); o += 4 + nlen;
+	if (o < plen && pl[o]) {                        /* want_reply */
+		uint8_t m = MSG_REQUEST_FAILURE;
+		send_packet(c, &m, 1);
+	}
 }
 
 static void handle_packet(ssh_conn *c, const uint8_t *pl, unsigned plen)
@@ -446,9 +700,10 @@ static void handle_packet(ssh_conn *c, const uint8_t *pl, unsigned plen)
 	uint8_t msg = plen ? pl[0] : 0;
 
 	/* messages allowed at any time */
-	if (msg == MSG_DISCONNECT) { fail(c, "peer disconnect"); return; }
+	if (msg == MSG_DISCONNECT) { c->state = SSH_ST_CLOSED; return; }
 	if (msg == MSG_IGNORE || msg == MSG_DEBUG || msg == MSG_UNIMPLEMENTED)
 		return;
+	if (msg == MSG_GLOBAL_REQUEST) { handle_global_request(c, pl, plen); return; }
 
 	switch (c->state) {
 	case SSH_ST_EXPECT_KEXINIT:
@@ -470,6 +725,25 @@ static void handle_packet(ssh_conn *c, const uint8_t *pl, unsigned plen)
 			fail(c, "expected SERVICE_REQUEST"); return;
 		}
 		handle_service_request(c, pl, plen);
+		return;
+	case SSH_ST_AUTH:
+		if (msg == MSG_USERAUTH_REQUEST) handle_userauth_request(c, pl, plen);
+		/* else ignore stray traffic while authenticating */
+		return;
+	case SSH_ST_SESSION:
+		switch (msg) {
+		case MSG_CHANNEL_OPEN:          handle_channel_open(c, pl, plen);   break;
+		case MSG_CHANNEL_REQUEST:       handle_channel_request(c, pl, plen);break;
+		case MSG_CHANNEL_DATA:          handle_channel_data(c, pl, plen);   break;
+		case MSG_CHANNEL_WINDOW_ADJUST: handle_channel_window_adjust(c, pl, plen); break;
+		case MSG_CHANNEL_EOF:           c->chan_eof = 1;                    break;
+		case MSG_CHANNEL_CLOSE:
+			if (!c->chan_sent_close) ssh_channel_close(c);
+			c->chan_closed = 1;
+			c->state = SSH_ST_CLOSED;
+			break;
+		default: /* CHANNEL_EXTENDED_DATA and anything else: ignore */      break;
+		}
 		return;
 	default:
 		fail(c, "unexpected packet");
@@ -576,7 +850,7 @@ int DOSSH_FAR ssh_input(ssh_conn *c, const uint8_t *data, unsigned n)
 	if (c->ib_len + n > SSH_IB_SZ) { fail(c, "input overflow"); return -1; }
 	if (n) { memcpy(c->ib + c->ib_len, data, n); c->ib_len += n; }
 
-	while (c->state != SSH_ST_ERROR && c->state != SSH_ST_DONE) {
+	while (c->state != SSH_ST_ERROR && c->state != SSH_ST_CLOSED) {
 		int r = (c->state == SSH_ST_VERSION) ? try_version(c)
 		                                     : try_packet(c);
 		if (r <= 0) break;
@@ -606,8 +880,122 @@ const char * DOSSH_FAR ssh_state_name(ssh_conn *c)
 	case SSH_ST_EXPECT_ECDH_INIT:       return "EXPECT_ECDH_INIT";
 	case SSH_ST_EXPECT_CLIENT_NEWKEYS:  return "EXPECT_CLIENT_NEWKEYS";
 	case SSH_ST_EXPECT_SERVICE_REQUEST: return "EXPECT_SERVICE_REQUEST";
-	case SSH_ST_DONE:                   return "DONE";
+	case SSH_ST_AUTH:                   return "AUTH";
+	case SSH_ST_SESSION:                return "SESSION";
+	case SSH_ST_CLOSED:                 return "CLOSED";
 	case SSH_ST_ERROR:                  return "ERROR";
 	default:                            return "?";
 	}
 }
+
+/* ---- userauth + session channel byte interface --------------------- */
+
+void DOSSH_FAR ssh_set_password(ssh_conn *c, const char *pw)
+{
+	unsigned k = 0;
+	if (pw)
+		while (pw[k] && k < sizeof(c->password) - 1) { c->password[k] = pw[k]; k++; }
+	c->password[k] = 0;
+	c->have_password = (k > 0);
+}
+
+int DOSSH_FAR ssh_authenticated(ssh_conn *c) { return c->authenticated; }
+
+int DOSSH_FAR ssh_channel_ready(ssh_conn *c)
+{
+	return c->chan_open && c->shell_ready && !c->chan_closed;
+}
+
+int DOSSH_FAR ssh_channel_getc(ssh_conn *c)
+{
+	int b;
+	if (c->cin_head == c->cin_tail) return -1;
+	b = c->cin[c->cin_head];
+	c->cin_head = (c->cin_head + 1) % SSH_CIN_SZ;
+	return b;
+}
+
+int DOSSH_FAR ssh_channel_putc(ssh_conn *c, int byte)
+{
+	if (!c->shell_ready || c->chan_closed) return 0;
+	if (c->cout_len >= SSH_COUT_SZ)         return 0;   /* staging buffer full */
+	c->cout[c->cout_len++] = (uint8_t)byte;
+	return 1;
+}
+
+void DOSSH_FAR ssh_channel_flush(ssh_conn *c)
+{
+	unsigned sent = 0;
+
+	if (!c->chan_open || c->chan_closed) { c->cout_len = 0; return; }
+
+	while (sent < c->cout_len) {
+		uint8_t pkt[9 + SSH_CHAN_CHUNK];
+		unsigned take = c->cout_len - sent, o;
+
+		if (take > SSH_CHAN_CHUNK)   take = SSH_CHAN_CHUNK;
+		if (take > c->peer_window)   take = c->peer_window;
+		if (take > c->peer_maxpkt)   take = c->peer_maxpkt;
+		if (take == 0) break;                       /* window exhausted */
+		/* leave room in the drain buffer so send_enc never overflows */
+		if (c->ob_len + take + 64 > SSH_OB_SZ) break;
+
+		o = 0;
+		pkt[o++] = MSG_CHANNEL_DATA;
+		put_u32(pkt + o, c->peer_chan); o += 4;
+		o += put_str(pkt + o, c->cout + sent, take);
+		send_packet(c, pkt, o);
+		if (c->state == SSH_ST_ERROR) break;
+		c->peer_window -= take;
+		sent += take;
+	}
+
+	if (sent) {
+		if (sent >= c->cout_len) c->cout_len = 0;
+		else { memmove(c->cout, c->cout + sent, c->cout_len - sent);
+		       c->cout_len -= sent; }
+	}
+}
+
+void DOSSH_FAR ssh_winsize(ssh_conn *c, int *cols, int *rows)
+{
+	if (cols) *cols = c->term_cols ? (int)c->term_cols : 80;
+	if (rows) *rows = c->term_rows ? (int)c->term_rows : 25;
+}
+
+int DOSSH_FAR ssh_channel_eof(ssh_conn *c) { return c->chan_eof; }
+
+void DOSSH_FAR ssh_channel_close(ssh_conn *c)
+{
+	uint8_t p[32];
+	unsigned o;
+
+	if (!c->chan_open || c->chan_sent_close) return;
+	ssh_channel_flush(c);                            /* push any staged bytes */
+
+	/* a clean logout: report exit-status 0 so the client exits 0 (RFC 4254
+	 * sec 6.10). Only meaningful once a shell/exec was actually granted. */
+	if (c->shell_ready) {
+		o = 0;
+		p[o++] = MSG_CHANNEL_REQUEST;
+		put_u32(p + o, c->peer_chan); o += 4;
+		o += put_str(p + o, (const uint8_t *)"exit-status", 11);
+		p[o++] = 0;                                  /* want_reply = FALSE */
+		put_u32(p + o, 0); o += 4;                   /* exit status 0       */
+		send_packet(c, p, o);
+	}
+
+	if (!c->chan_sent_eof) {
+		p[0] = MSG_CHANNEL_EOF;
+		put_u32(p + 1, c->peer_chan);
+		send_packet(c, p, 5);
+		c->chan_sent_eof = 1;
+	}
+	p[0] = MSG_CHANNEL_CLOSE;
+	put_u32(p + 1, c->peer_chan);
+	send_packet(c, p, 5);
+	c->chan_sent_close = 1;
+	c->chan_closed = 1;
+}
+
+int DOSSH_FAR ssh_channel_closed(ssh_conn *c) { return c->chan_closed; }
