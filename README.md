@@ -9,8 +9,10 @@ keyboard of a headless DOS machine over TCP/IP.
 > straight to video memory) — carries the session over **TCP via a DOS packet
 > driver** (not just serial), and mirrors the screen as **ANSI over telnet**,
 > so you connect with a stock `telnet`, `nc`, or PuTTY — **no custom client**.
-> All proven end-to-end in QEMU. See [docs/DESIGN.md](docs/DESIGN.md) for the
-> architecture.
+> Proven end-to-end in QEMU **and on real hardware** — MS-DOS and FreeDOS, over
+> an onboard Realtek RTL8168h. See [docs/DESIGN.md](docs/DESIGN.md) for the
+> architecture and [docs/NETWORKING.md](docs/NETWORKING.md) to get it running on
+> a real or emulated NIC.
 
 ## Why
 
