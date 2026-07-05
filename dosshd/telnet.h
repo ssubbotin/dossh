@@ -14,8 +14,8 @@
 #ifndef DOSSH_TELNET_H
 #define DOSSH_TELNET_H
 
-void telnet_reset( int slot );          /* new connection: reset slot IAC state  */
-void telnet_hello( int slot );          /* queue the proactive negotiation bytes */
+void telnet_set_password( const char *pw ); /* install the auth password (empty = off) */
+void telnet_begin( int slot );          /* new connection: negotiate + auth-gate  */
 void telnet_in( int slot, unsigned char b ); /* one inbound byte: strip IAC, else key */
 
 #endif

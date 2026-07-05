@@ -48,9 +48,11 @@ void          net_release( unsigned char int_no, unsigned handle );
 int  net_connected( void );        /* 1 if any client TCP session is ESTABLISHED */
 int  net_slots( void );            /* number of connection slots (NCONN)          */
 int  net_take_new_slot( void );    /* index of a just-connected slot, else -1     */
-int  net_tx_putc( int c );         /* broadcast a byte to all clients; 0 if any is full */
+int  net_tx_putc( int c );         /* broadcast a byte to all admitted clients; 0 if any is full */
 int  net_tx_putc_slot( int i, int c ); /* unicast a byte to one slot; 0 if full   */
 void net_tx_flush( void );         /* push queued bytes out as TCP segments        */
 int  net_rx_getc( int i );         /* next byte received from slot i, or -1        */
+void net_slot_ready( int i, int v );/* admit (1) / un-admit (0) a slot to broadcast */
+void net_slot_drop( int i );       /* reject a slot: abort the session, re-LISTEN  */
 
 #endif

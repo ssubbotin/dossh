@@ -104,9 +104,11 @@ DOSSH disables terminal auto-wrap for the session (so painting the bottom-right
 cell can't scroll the screen). If your *local* shell looks off after
 disconnecting (long lines no longer wrapping), run `reset`.
 
-**Security:** the wire is plaintext telnet with no authentication yet — fine on a
-trusted, isolated LAN. On anything else, put it behind a tunnel (`ssh -L`, a VPN,
-or stunnel). See **[docs/SECURITY.md](docs/SECURITY.md)**.
+**Security:** the wire is plaintext telnet. There is an optional password gate
+(`DOSSHD /NET <ip> <port> /P:<pw>` — the client is prompted before it gets the
+screen or keyboard), but no encryption, so on anything other than a trusted,
+isolated LAN put it behind a tunnel (`ssh -L`, a VPN, or stunnel) — the password
+itself is cleartext otherwise. See **[docs/SECURITY.md](docs/SECURITY.md)**.
 
 ## Roadmap
 
@@ -129,7 +131,10 @@ or stunnel). See **[docs/SECURITY.md](docs/SECURITY.md)**.
 - [x] **Multiple simultaneous clients** — the TCP stack serves several
       connections at once (broadcast screen, merged keyboard);
       `test/e2e-m5-multiclient.py` drives two clients sharing one console.
-- [ ] Authentication; optional transport encryption.
+- [x] **Password authentication** — an optional gate before the console
+      (`DOSSHD /NET <ip> <port> /P:<pw>`): a client is prompted and sees neither
+      screen nor keyboard until it authenticates. `test/e2e-auth.py` proves it.
+- [ ] Optional transport encryption (today: tunnel it — see docs/SECURITY.md).
 
 ## Building & testing
 

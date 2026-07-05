@@ -48,9 +48,12 @@ if [ "$TRANSPORT" = pkt ]; then
         curl -sSLo amdnic_2.zip "https://packetdriversdos.net/ZIP/amdnic_2.zip"
         unzip -oj amdnic_2.zip "PKTDRVR/PCNTPK.COM" >/dev/null
     fi
-    # load the packet driver at INT 0x60 (auto-detects the PCI NIC), then /NET
-    printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHD /NET %s %s\r\n' \
-        "$GUEST_IP" "$PORT" > AUTOEXEC.BAT
+    # load the packet driver at INT 0x60 (auto-detects the PCI NIC), then /NET.
+    # PW=<pw> (optional) gates the console with a password (/P:<pw>).
+    PWARG=""
+    [ -n "$PW" ] && PWARG=" /P:$PW"
+    printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHD /NET %s %s%s\r\n' \
+        "$GUEST_IP" "$PORT" "$PWARG" > AUTOEXEC.BAT
     mcopy -i dosshd.img -o PCNTPK.COM ::PCNTPK.COM
 else
     printf '@ECHO OFF\r\nDOSSHD\r\n' > AUTOEXEC.BAT

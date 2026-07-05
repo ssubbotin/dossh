@@ -268,6 +268,7 @@ struct conn {
     unsigned long rexmit_at;
     unsigned      rexmit_count;   /* consecutive retransmits w/o progress */
     int           just_estab;     /* edge flag consumed once by net_take_new_slot */
+    unsigned char ready;          /* 1 = admitted to the broadcast (auth gate) */
 };
 static struct conn conns[NCONN];
 
@@ -282,6 +283,7 @@ static void tcp_reset_listen( struct conn *c )
     c->s_una = c->s_nxt = c->s_end = 0;
     c->r_head = c->r_tail = 0;
     c->rexmit_count = 0;
+    c->ready = 0;                  /* a fresh slot is not yet admitted */
 }
 
 /* send one TCP segment: flags, seq/ack from state, optional MSS option,
@@ -593,9 +595,11 @@ int net_take_new_slot( void )
     return -1;
 }
 
-/* Broadcast one screen byte to every connected client, all-or-none: append only
- * if EVERY ESTAB conn has room, else 0 so tx_pump's render_pushback paces the
- * shared stream to the slowest client and all clients stay byte-identical.
+/* Broadcast one screen byte to every admitted (ready) client, all-or-none:
+ * append only if EVERY such conn has room, else 0 so tx_pump's render_pushback
+ * paces the shared stream to the slowest client and all stay byte-identical.
+ * Not-ready slots (connected but not past the auth gate) are excluded entirely,
+ * so an unauthenticated client never sees the screen.
  *
  * A full buffer whose peer is still ACKing (rexmit_count == 0) just means that
  * client is momentarily slow: pace (return 0) and it catches up. A full buffer
@@ -605,7 +609,7 @@ int net_tx_putc( int ch )
 {
     int i;
     for( i = 0; i < NCONN; i++ )
-        if( conns[i].tstate == TS_ESTAB ) {
+        if( conns[i].tstate == TS_ESTAB && conns[i].ready ) {
             unsigned used = (conns[i].s_end - conns[i].s_una) & SND_MASK;
             if( used >= SND_SZ - 1 ) {
                 if( conns[i].rexmit_count > 0 )
@@ -615,11 +619,31 @@ int net_tx_putc( int ch )
             }
         }
     for( i = 0; i < NCONN; i++ )
-        if( conns[i].tstate == TS_ESTAB ) {
+        if( conns[i].tstate == TS_ESTAB && conns[i].ready ) {
             conns[i].sbuf[conns[i].s_end] = (unsigned char)ch;
             conns[i].s_end = (conns[i].s_end + 1) & SND_MASK;
         }
     return 1;
+}
+
+/* auth gate: the framing code admits a slot to the broadcast once it clears
+ * authentication (net.c itself stays auth-agnostic - it only knows "ready"). */
+void net_slot_ready( int i, int v )
+{
+    if( i >= 0 && i < NCONN )
+        conns[i].ready = (unsigned char)( v ? 1 : 0 );
+}
+
+/* reject a slot: abort its TCP session (RST|ACK) and return it to LISTEN. */
+void net_slot_drop( int i )
+{
+    struct conn *c;
+    if( i < 0 || i >= NCONN )
+        return;
+    c = &conns[i];
+    if( c->tstate == TS_ESTAB )
+        tcp_send_seg( c, 0x14, 0, 0, 0 );   /* RST|ACK: close on the client */
+    tcp_reset_listen( c );
 }
 
 /* Unicast one byte to a single slot (the telnet hello, sent per new client). */

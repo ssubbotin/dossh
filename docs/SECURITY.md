@@ -1,10 +1,10 @@
 # Security
 
-DOSSH is a plaintext telnet console with **no built-in authentication or
-encryption yet**. Treat the wire as fully readable: anyone who can reach the port
-sees the screen and every keystroke. That is fine on a trusted, isolated LAN; for
-anything beyond that, put it behind a tunnel (encryption) and restrict who can
-reach the port (a password gate is planned — see the roadmap).
+DOSSH has an **optional password gate** (below) but **no encryption**. Treat the
+wire as fully readable: anyone who can reach the port sees the screen and every
+keystroke — *including the password*. That is fine on a trusted, isolated LAN;
+for anything beyond that, put it behind a tunnel (encryption) and restrict who
+can reach the port.
 
 Full SSH/TLS crypto is impractical to build *inside* a 16-bit real-mode TSR — not
 because of CPU or memory on a modern box, but because implementing the SSH
@@ -48,10 +48,21 @@ than A/B; use it if you specifically need TLS.
 
 ## Authentication
 
-Planned: a password gate shown before the console is granted. Until it lands,
-restrict reachability (firewall / VPN-only). A password sent over an encrypted
-tunnel (A/B/C above) is the intended posture — never over bare telnet on an
-untrusted network.
+`DOSSHD /NET` takes an optional password gate:
+
+```sh
+DOSSHD /NET <ip> <port> /P:<password>
+```
+
+A connecting client is prompted for the password and is shown **neither the
+screen nor allowed to inject keys** until it authenticates; three wrong tries
+drop the connection. Each client authenticates independently. With no `/P:` the
+console is open (backward-compatible).
+
+The password crosses the wire in **cleartext** (this is telnet), so it is only
+meaningful *inside* an encrypted tunnel (A/B/C above) or on a trusted LAN — never
+send it over bare telnet on an untrusted network. The gate stops casual access
+and multi-user free-for-alls; it is **not** a substitute for the tunnel.
 
 ## What DOSSH does *not* do
 

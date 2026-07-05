@@ -187,14 +187,12 @@ static void net_tick( void )
 
     net_poll();                               /* rx + tcp + retransmit */
 
-    /* each newly ESTABLISHED client: unicast the telnet hello, force a full
-       repaint so it gets the whole screen (broadcast to all - one repaint per
-       join is the cost of the shared stream) */
-    while( (i = net_take_new_slot()) >= 0 ) {
-        telnet_reset( i );
-        telnet_hello( i );                    /* negotiate char mode */
-        render_reset();                       /* then full repaint   */
-    }
+    /* each newly ESTABLISHED client: negotiate char mode and run the auth gate.
+       With no password telnet_begin admits it and forces a full repaint (one
+       repaint per join is the cost of the shared stream); with a password it
+       prompts and holds the slot out of the broadcast until it authenticates. */
+    while( (i = net_take_new_slot()) >= 0 )
+        telnet_begin( i );
 
     /* merge keystrokes from every client into the one BIOS ring */
     for( i = 0; i < net_slots(); i++ )
@@ -420,18 +418,30 @@ int main( int argc, char *argv[] )
         if( opt_is( argv[1], "U" ) ) return uninstall();
         if( opt_is( argv[1], "S" ) ) return status();
         if( opt_is( argv[1], "NET" ) ) {
+            int ai, pos = 0;                  /* positional args: 0 = ip, 1 = port */
             g_net = 1;
-            if( argc > 2 && !parse_ip( argv[2], net_ip ) ) {
-                printf( "DOSSHD: bad IP '%s'\n", argv[2] );
-                return 1;
+            for( ai = 2; ai < argc; ai++ ) {
+                char *a = argv[ai];
+                if( ( a[0] == '/' || a[0] == '-' )
+                    && ( a[1] == 'P' || a[1] == 'p' ) && a[2] == ':' ) {
+                    telnet_set_password( a + 3 ); /* /P:<pw> anywhere on the line */
+                } else if( pos == 0 ) {
+                    if( !parse_ip( a, net_ip ) ) {
+                        printf( "DOSSHD: bad IP '%s'\n", a );
+                        return 1;
+                    }
+                    pos = 1;
+                } else if( pos == 1 ) {
+                    net_port = (unsigned)atoi( a );
+                    pos = 2;
+                }
             }
-            if( argc > 3 )
-                net_port = (unsigned)atoi( argv[3] );
         } else {
-            printf( "usage: DOSSHD                    install over serial (COM1)\n"
-                    "       DOSSHD /NET [ip] [port]   install over TCP (port defaults to 23)\n"
-                    "       DOSSHD /S                 status\n"
-                    "       DOSSHD /U                 uninstall\n" );
+            printf( "usage: DOSSHD                       install over serial (COM1)\n"
+                    "       DOSSHD /NET [ip] [port] [/P:pw]  install over TCP (port 23;\n"
+                    "                                        /P: gates with a password)\n"
+                    "       DOSSHD /S                    status\n"
+                    "       DOSSHD /U                    uninstall\n" );
             return 1;
         }
     }
