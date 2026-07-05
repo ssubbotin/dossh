@@ -91,7 +91,7 @@ static unsigned sh_cols, sh_rows;
 static int force_kf = 1;
 static unsigned long last_kf;
 
-static int frame_active, is_repaint, is_toobig;
+static int frame_active, is_repaint, is_soft, is_toobig;
 static unsigned walk_cell, total_cells, f_cols;
 static int last_emit, cur_sgr;
 static unsigned char last_cur_r = 255, last_cur_c = 255;
@@ -111,7 +111,7 @@ static void frame_decide( int serial )
     unsigned cols = scr_cols(), rows = scr_rows();
     unsigned char __far *v;
     unsigned c, bytes, changed = 0, rc;
-    int repaint, clear;
+    int repaint, clear, soft = 0;
     (void)serial;
 
     if( cols == 0 || cols > 132 ) cols = 80;
@@ -123,12 +123,13 @@ static void frame_decide( int serial )
     /* A hard clear (ESC[2J) is only for a new connection or a geometry change. */
     clear = force_kf || !shadow_valid || cols != sh_cols || rows != sh_rows;
     repaint = clear;
-    /* Periodic full repaint on BOTH transports: re-emit every cell WITHOUT a
-       clear (so no flicker - repainting identical content is invisible, but it
-       paints over any stale cell). This self-heals a screen left garbled by a
-       dropped connect-repaint on a lossy link, which a pure diff never fixes. */
-    if( !repaint && (long)( ticks() - last_kf ) >= CADENCE_TICKS )
-        repaint = 1;
+    /* Periodic SOFT full repaint on both transports: re-emit every cell without
+       a clear AND without touching the cursor (no ESC[?25l/h) - it paints over
+       identical content invisibly, so it self-heals a screen garbled by a
+       dropped repaint on a lossy link without any cursor blink. */
+    if( !repaint && (long)( ticks() - last_kf ) >= CADENCE_TICKS ) {
+        repaint = 1; soft = 1;
+    }
     if( is_toobig )                  /* no shadow to diff: only full frames */
         clear = repaint = force_kf
                         || ( (long)( ticks() - last_kf ) >= CADENCE_TICKS );
@@ -151,9 +152,10 @@ static void frame_decide( int serial )
     }
 
     f_cols = cols; total_cells = cols * rows;
-    is_repaint = repaint; walk_cell = 0;
+    is_repaint = repaint; is_soft = soft; walk_cell = 0;
     last_emit = -2; cur_sgr = -1; frame_active = 1;
-    e_s( "\x1b[?25l" );              /* hide cursor while painting */
+    if( !soft )
+        e_s( "\x1b[?25l" );          /* hide cursor while painting (not soft) */
     if( clear )
         e_s( "\x1b[2J\x1b[H" );
     if( repaint ) {
@@ -193,8 +195,9 @@ static void frame_fill( void )
     if( c >= total ) {               /* frame complete */
         unsigned rc = cursor_rc();
         unsigned char cr = (unsigned char)( rc >> 8 ), cc = (unsigned char)rc;
-        e_cup( cr, cc );
-        e_s( cursor_visible() ? "\x1b[?25h" : "\x1b[?25l" );
+        e_cup( cr, cc );             /* park at the DOS cursor */
+        if( !is_soft )               /* soft frame: leave cursor visibility be */
+            e_s( cursor_visible() ? "\x1b[?25h" : "\x1b[?25l" );
         last_cur_r = cr; last_cur_c = cc;
         frame_active = 0;
         if( !is_toobig ) shadow_valid = 1;
