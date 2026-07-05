@@ -111,7 +111,8 @@ static void frame_decide( int serial )
     unsigned cols = scr_cols(), rows = scr_rows();
     unsigned char __far *v;
     unsigned c, bytes, changed = 0, rc;
-    int repaint;
+    int repaint, clear;
+    (void)serial;
 
     if( cols == 0 || cols > 132 ) cols = 80;
     if( rows == 0 || rows > 60  ) rows = 25;
@@ -119,11 +120,18 @@ static void frame_decide( int serial )
     v = scr_base();
     is_toobig = ( bytes > SHADOW_BYTES );
 
-    repaint = force_kf || !shadow_valid || cols != sh_cols || rows != sh_rows;
-    if( is_toobig )
-        repaint = force_kf || ( (long)( ticks() - last_kf ) >= CADENCE_TICKS );
-    else if( !repaint && serial && (long)( ticks() - last_kf ) >= CADENCE_TICKS )
+    /* A hard clear (ESC[2J) is only for a new connection or a geometry change. */
+    clear = force_kf || !shadow_valid || cols != sh_cols || rows != sh_rows;
+    repaint = clear;
+    /* Periodic full repaint on BOTH transports: re-emit every cell WITHOUT a
+       clear (so no flicker - repainting identical content is invisible, but it
+       paints over any stale cell). This self-heals a screen left garbled by a
+       dropped connect-repaint on a lossy link, which a pure diff never fixes. */
+    if( !repaint && (long)( ticks() - last_kf ) >= CADENCE_TICKS )
         repaint = 1;
+    if( is_toobig )                  /* no shadow to diff: only full frames */
+        clear = repaint = force_kf
+                        || ( (long)( ticks() - last_kf ) >= CADENCE_TICKS );
 
     /* large modes have no shadow to diff against (bytes > SHADOW_BYTES); between
        cadence repaints there is nothing to send - and diffing here would read
@@ -138,7 +146,7 @@ static void frame_decide( int serial )
         if( changed == 0 && (unsigned char)(rc >> 8) == last_cur_r
                          && (unsigned char)rc == last_cur_c )
             return;                  /* idle - send nothing */
-        if( changed * 4 > ( bytes / 2 ) * 3 )   /* >75% cells -> repaint */
+        if( changed * 4 > ( bytes / 2 ) * 3 )   /* >75% cells -> soft repaint */
             repaint = 1;
     }
 
@@ -146,8 +154,9 @@ static void frame_decide( int serial )
     is_repaint = repaint; walk_cell = 0;
     last_emit = -2; cur_sgr = -1; frame_active = 1;
     e_s( "\x1b[?25l" );              /* hide cursor while painting */
-    if( repaint ) {
+    if( clear )
         e_s( "\x1b[2J\x1b[H" );
+    if( repaint ) {
         sh_cols = cols; sh_rows = rows;
     }
 }
