@@ -1,18 +1,24 @@
 # DOSSH
 
-**SSH-style remote access to a real-mode DOS PC** — see the screen and drive the
-keyboard of a headless DOS machine over TCP/IP.
+**SSH (or telnet) straight into a real-mode DOS PC** — see the screen and drive
+the keyboard of a headless DOS machine over TCP/IP, with a real SSH server running
+*on the DOS box itself*.
 
-> **Status: resident, interactive, networked, and speaks telnet.** `DOSSHD`
-> installs as a TSR — the screen mirror and keyboard injection keep working
-> while any separately launched program runs (including ones that write
-> straight to video memory) — carries the session over **TCP via a DOS packet
-> driver** (not just serial), and mirrors the screen as **ANSI over telnet**,
-> so you connect with a stock `telnet`, `nc`, or PuTTY — **no custom client**.
-> Proven end-to-end in QEMU **and on real hardware** — MS-DOS and FreeDOS, over
-> an onboard Realtek RTL8168h. See [docs/DESIGN.md](docs/DESIGN.md) for the
-> architecture and [docs/NETWORKING.md](docs/NETWORKING.md) to get it running on
-> a real or emulated NIC.
+> **Status: 1.0.** `DOSSHD` installs as a TSR that mirrors the VGA text screen and
+> injects the keyboard over the network — and keeps doing it while any separately
+> launched program runs, including ones that write straight to video memory. You
+> reach it two ways, both with **no custom client**:
+>
+> - **telnet / ANSI** — any stock `telnet`, `nc`, or PuTTY (`DOSSHD.EXE`);
+> - a **native SSH server that runs on the DOS box** — a stock `ssh` client, with
+>   the `curve25519` + `ed25519` + `chacha20-poly1305` crypto computed from the
+>   timer tick; password *or* publickey auth, multi-client (`DOSSHDS.EXE`).
+>
+> Telnet is proven end-to-end in QEMU **and on real hardware** (MS-DOS + FreeDOS
+> over an onboard Realtek RTL8168h); SSH is proven in QEMU on **both MS-DOS 6.22
+> and FreeDOS** (experimental — see [docs/DESIGN-ssh.md](docs/DESIGN-ssh.md)). See
+> [docs/DESIGN.md](docs/DESIGN.md) for the architecture and
+> [docs/NETWORKING.md](docs/NETWORKING.md) to run it on a real or emulated NIC.
 
 ## Why
 
@@ -48,8 +54,8 @@ reach it from anywhere on the network.
   control the whole machine.
 
 ```
-   [ your laptop ]  ── TCP/IP ──▶  [ real DOS PC running DOSSHD.EXE ]
-    telnet / nc / PuTTY              packet driver  ->  TCP (telnet)
+   [ your laptop ]  ── TCP/IP ──▶  [ DOS PC running DOSSHD.EXE / DOSSHDS.EXE ]
+    ssh / telnet / nc / PuTTY        packet driver  ->  TCP (telnet or SSH)
     renders the ANSI screen          scrape 0xB8000  ->  ANSI diff stream
     sends keystrokes                 inject keys     ->  BIOS kbd buffer
 ```
@@ -139,8 +145,8 @@ server *inside* the TSR, so a stock `ssh` client reaches the DOS box with real
 end-to-end encryption — no tunnel needed:
 
 ```sh
-DOSSHDS /SSH <ip> <port> /P:<password>     # on the DOS box (needs a 586+ CPU)
-ssh -p <port> user@<dos-box-ip>            # from anywhere, with a stock ssh
+DOSSHDS /SSH <ip> /P:<password>            # on the DOS box (defaults to port 22; needs a 586+ CPU)
+ssh user@<dos-box-ip>                      # from anywhere — a plain stock ssh, no -p
 ```
 
 **Key-based login (no password on the wire).** Drop your public key into an
@@ -153,9 +159,10 @@ It speaks `curve25519-sha256` + `ssh-ed25519` + `chacha20-poly1305@openssh.com`,
 all computed on the DOS box from the timer tick, and it is **multi-client** — two
 or more people can `ssh` in at once to share and drive one console, each over its
 own encrypted session (the shared screen is rendered once and encrypted per
-client). **Experimental / pre-1.0:** DOS has no OS entropy source, so its keys
-are weaker than a real OS RNG (see [docs/DESIGN-ssh.md](docs/DESIGN-ssh.md)) — for
-a hardened setup the tunnel above is still the conservative choice. The default
+client), verified in QEMU on both **MS-DOS 6.22 and FreeDOS**. **Experimental:**
+DOS has no OS entropy source, so its keys are weaker than a real OS RNG (see
+[docs/DESIGN-ssh.md](docs/DESIGN-ssh.md)) — for a hardened setup the tunnel above
+is still the conservative choice. The default
 `DOSSHD.EXE` (telnet, 8086-compatible) is unchanged; SSH lives only in
 `DOSSHDS.EXE`.
 
@@ -210,6 +217,12 @@ shared programmed-DMA send does not — see [docs/DESIGN.md](docs/DESIGN.md) §1
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full architecture, the interrupt and
 memory details, and the wire-protocol sketch.
+
+## Acknowledgments
+
+Built in collaboration with [Claude Code](https://claude.com/claude-code) — the
+design, the in-house ARP/IP/TCP and SSH stacks, and the QEMU test suites were
+developed together with Claude as a co-author.
 
 ## License
 
