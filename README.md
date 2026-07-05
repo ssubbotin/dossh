@@ -135,6 +135,12 @@ DOSSHDS /SSH <ip> <port> /P:<password>     # on the DOS box (needs a 586+ CPU)
 ssh -p <port> user@<dos-box-ip>            # from anywhere, with a stock ssh
 ```
 
+**Key-based login (no password on the wire).** Drop your public key into an
+`AUTHKEYS` file next to `DOSSHDS.EXE` (standard OpenSSH format — copy a line from
+your `~/.ssh/id_ed25519.pub`) and connect with `ssh -i ~/.ssh/id_ed25519 …`; the
+box verifies the signature and never sees a password. Only `ssh-ed25519` keys are
+accepted (the crypto library has no RSA), and password + key auth coexist.
+
 It speaks `curve25519-sha256` + `ssh-ed25519` + `chacha20-poly1305@openssh.com`,
 all computed on the DOS box from the timer tick. **Experimental / pre-1.0:** it is
 single-client, and DOS has no OS entropy source, so its keys are weaker than a
@@ -171,7 +177,10 @@ the tunnel above is still the conservative choice. The default `DOSSHD.EXE`
       ed25519 + chacha20-poly1305), terminating in the TSR from the timer tick.
       Single-client (P1) in the separate `DOSSHDS.EXE` build; `test/e2e-ssh-dos.py`
       drives a real OpenSSH client against a DOS box in QEMU.
-- [ ] SSH: publickey auth (P2), multi-client encryption (P3).
+- [x] **SSH publickey auth** — drop an `ssh-ed25519` key in `AUTHKEYS` and
+      `ssh -i` logs in with no password on the wire; the box verifies the
+      signature (RFC 4252 §7). `test/e2e-ssh-pubkey.sh` proves it against OpenSSH.
+- [ ] SSH: multi-client encryption (P3).
 - [x] Transport encryption — the native SSH build above, or a tunnel
       (`ssh -L` / VPN / stunnel — see docs/SECURITY.md).
 
