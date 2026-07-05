@@ -55,6 +55,15 @@ static int g_net;
 static unsigned char net_ip[4] = { 10, 0, 2, 15 };
 static unsigned      net_port  = 23;      /* the telnet port, so `telnet <host>` works */
 
+/* opt-in Ctrl-D disconnect (the /EOF install flag). When set, a connected client
+ * pressing Ctrl-D (0x04) disconnects THAT one client's session instead of the
+ * byte reaching DOS - it does not touch the box or the other clients. Default 0:
+ * 0x04 passes straight through to DOS, keeping DOSSH a transparent KVM (stealing
+ * a key is opt-in, like the warm-reboot sentinel). Non-static: telnet.c reads it
+ * on its per-slot keystroke path (post-IAC, so a NAWS coordinate byte that
+ * happens to be 0x04 can never be mistaken for a disconnect). */
+int g_eof_exit;
+
 #ifdef DOSSH_SSH
 /* ---- SSH server state (resident, DGROUP) ---------------------------------
  * P3: multi-client. One ssh_conn per net.c slot (1:1), so up to NCONN clients
@@ -419,9 +428,19 @@ static void ssh_net_worker( void )
         ssh_pump_output( i );                  /* handshake / protocol replies  */
 
         /* merged keyboard: drain this slot's decrypted keystrokes (the shared
-           ring holds only this slot's bytes right now) into the one BIOS ring. */
-        while( ( b = ssh_channel_getc( &ssh_slots[i] ) ) >= 0 )
+           ring holds only this slot's bytes right now) into the one BIOS ring.
+           With /EOF, a Ctrl-D (0x04) from THIS client closes its channel and
+           drops its slot instead of reaching DOS; the bytes are clean keystrokes
+           here (post-SSH-record), so the check is exact. */
+        while( ( b = ssh_channel_getc( &ssh_slots[i] ) ) >= 0 ) {
+            if( g_eof_exit && b == 0x04 ) {
+                ssh_channel_close( &ssh_slots[i] ); /* EOF+CLOSE+exit-status 0     */
+                ssh_pump_output( i );               /* stage the close on the ring */
+                net_tx_flush();                     /* ... and send it before RST  */
+                break;                              /* teardown below drops the slot */
+            }
             ansi_key_byte( (unsigned char)b );
+        }
 
         if( ssh_channel_ready( &ssh_slots[i] ) ) {
             int cols, rows;
@@ -529,8 +548,14 @@ static void ssh_serial_worker( void )
             g_ssh_cols = cols; g_ssh_rows = rows;
             render_reset();
         }
-        while( ( b = ssh_channel_getc( &ssh_slots[0] ) ) >= 0 )
+        while( ( b = ssh_channel_getc( &ssh_slots[0] ) ) >= 0 ) {
+            if( g_eof_exit && b == 0x04 ) {         /* opt-in Ctrl-D: end session */
+                ssh_channel_close( &ssh_slots[0] ); /* EOF+CLOSE so `ssh` exits   */
+                ssh_serial_pump_output();
+                break;
+            }
             ansi_key_byte( (unsigned char)b );
+        }
         ssh_tx_pump();
         ssh_channel_flush( &ssh_slots[0] );
         ssh_serial_pump_output();
@@ -769,6 +794,9 @@ static int install( void )
     }                                         /* non-SSH transport branch */
     }                                         /* authdesc scope           */
 #endif
+    if( g_eof_exit )
+        printf( "DOSSHD: /EOF set - a client's Ctrl-D disconnects that session"
+                " (not passed to DOS).\n" );
     _dos_keep( 0, paras );                    /* stay resident; no return */
     return 0;                                 /* not reached */
 }
@@ -885,6 +913,8 @@ int main( int argc, char *argv[] )
                            || stricmp( a, "COM1" ) == 0 ) {
                     g_ssh_serial = 1;         /* SSH over the COM1 serial line */
                     g_net        = 0;
+                } else if( opt_is( a, "EOF" ) ) {
+                    g_eof_exit = 1;           /* client Ctrl-D disconnects its session */
                 } else if( pos == 0 ) {
                     if( !parse_ip( a, net_ip ) ) {
                         printf( "DOSSHD: bad IP '%s'\n", a );
@@ -906,6 +936,8 @@ int main( int argc, char *argv[] )
                 if( ( a[0] == '/' || a[0] == '-' )
                     && ( a[1] == 'P' || a[1] == 'p' ) && a[2] == ':' ) {
                     telnet_set_password( a + 3 ); /* /P:<pw> anywhere on the line */
+                } else if( opt_is( a, "EOF" ) ) {
+                    g_eof_exit = 1;           /* client Ctrl-D disconnects its session */
                 } else if( pos == 0 ) {
                     if( !parse_ip( a, net_ip ) ) {
                         printf( "DOSSHD: bad IP '%s'\n", a );
@@ -919,14 +951,16 @@ int main( int argc, char *argv[] )
             }
         } else {
             printf( "usage: DOSSHD                       install over serial (COM1)\n"
-                    "       DOSSHD /NET [ip] [port] [/P:pw]  install over TCP (port 23;\n"
-                    "                                        /P: gates with a password)\n"
+                    "       DOSSHD /NET [ip] [port] [/P:pw] [/EOF]  install over TCP (port 23;\n"
+                    "                                        /P: gates with a password;\n"
+                    "                                        /EOF: client Ctrl-D disconnects)\n"
                     "       DOSSHD /S                    status\n"
                     "       DOSSHD /U                    uninstall\n" );
 #ifdef DOSSH_SSH
-            printf( "       DOSSHD /SSH [ip] [port] [/P:pw]  install as an SSH server over TCP\n"
-                    "       DOSSHD /SSH /COM [/P:pw]         install as an SSH server over COM1\n"
-                    "                                        (EXPERIMENTAL; port 22; /P: sets the password)\n" );
+            printf( "       DOSSHD /SSH [ip] [port] [/P:pw] [/EOF]  SSH server over TCP\n"
+                    "       DOSSHD /SSH /COM [/P:pw] [/EOF]         SSH server over COM1\n"
+                    "                                        (EXPERIMENTAL; port 22; /P: password;\n"
+                    "                                         /EOF: client Ctrl-D disconnects)\n" );
 #endif
             return 1;
         }

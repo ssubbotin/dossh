@@ -106,9 +106,17 @@ client are merged into the one keyboard, so you can watch together or hand off
 between machines. A client that drops uncleanly is reaped on its own so it can't
 freeze the others.
 
-**Disconnect** from the client — `exit`/`Ctrl-D` are forwarded to DOS, not to the
-link, so close from the client: `telnet` → `Ctrl-]` then `quit`; `nc` →
-`Ctrl-C`; PuTTY → close the window.
+**Disconnect** from the client — by default DOSSH is a transparent KVM, so
+`exit`/`Ctrl-D` are forwarded to DOS, not to the link; close from the client
+side: `telnet` → `Ctrl-]` then `quit`; `nc` → `Ctrl-C`; `ssh` → `~.`; PuTTY →
+close the window. Add **`/EOF`** at install (`DOSSHD /NET <ip> <port> /EOF`,
+`DOSSHDS /SSH <ip> <port> /EOF`, combinable with `/P:`) to opt in to a **Ctrl-D
+disconnect**: a connected client pressing **Ctrl-D** then drops *its own* session
+(the SSH channel is closed, or the telnet socket is reset and re-listened) —
+without touching DOS, the box, or the other clients. It is **off by default**
+(stealing a key must be deliberate, like the reboot sentinel), and the
+client-side quits above (`~.`, `Ctrl-]` then `quit`) keep working whether or not
+`/EOF` is set.
 
 **Reboot the box** — type **`Ctrl-^` three times then `Y`** (`0x1E` ×3, then
 `Y`; `Ctrl-^` is Ctrl-Shift-6 on a US keyboard). This warm-boots the DOS machine

@@ -71,6 +71,13 @@ python3 test/e2e-ssh-dos.py || { echo "FAILED: e2e-ssh-dos"; exit 1; }
 echo "-- e2e-ssh-multiclient --"
 python3 test/e2e-ssh-multiclient.py || { echo "FAILED: e2e-ssh-multiclient"; exit 1; }
 
+# Opt-in Ctrl-D disconnect (the /EOF flag): with /EOF a client's Ctrl-D closes
+# that ONE ssh session while the box stays up for others; without /EOF the byte
+# passes through to DOS (default transparent-KVM behavior). Drives a real ssh
+# client against a DOS box in QEMU, both /EOF on and off.
+echo "-- e2e-ssh-ctrld --"
+python3 test/e2e-ssh-ctrld.py || { echo "FAILED: e2e-ssh-ctrld"; exit 1; }
+
 # Opt-in NDIS2/DIS_PKT smoke test - builds a net floppy with net/mkbootdisk.sh
 # and drives DOSSHD over an emulated NIC. Skips unless DOSSH_DRIVERS is set (the
 # DOS networking stack is vendor-supplied; see docs/NETWORKING.md).

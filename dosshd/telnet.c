@@ -16,6 +16,7 @@
 extern int  net_tx_putc_slot( int i, int c );/* net.c: queue a byte to one slot */
 extern void ansi_key_byte( unsigned char b );/* ansikey.c: map a keystroke byte */
 extern void render_reset( void );            /* render.c: force a full repaint  */
+extern int  g_eof_exit;                      /* dosshd.c: /EOF opt-in Ctrl-D drop */
 
 /* telnet commands */
 #define IAC   255
@@ -128,6 +129,10 @@ static void au_check( int i )
 static void feed_data( int i, unsigned char b )
 {
     if( au_state[i] == AU_OK ) {
+        if( g_eof_exit && b == 0x04 ) {  /* opt-in Ctrl-D: drop THIS client only  */
+            net_slot_drop( i );          /* RST + re-LISTEN this slot (like au_check) */
+            return;                      /* consume: never inject 0x04 into DOS   */
+        }
         ansi_key_byte( b );
         return;
     }

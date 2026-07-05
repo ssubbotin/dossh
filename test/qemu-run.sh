@@ -72,25 +72,30 @@ pkt|ssh)
         unzip -oj amdnic_2.zip "PKTDRVR/PCNTPK.COM" >/dev/null
     fi
     # load the packet driver at INT 0x60 (auto-detects the PCI NIC), then the
-    # server. PW=<pw> (optional) gates the console with a password (/P:<pw>).
+    # server. PW=<pw> (optional) gates the console with a password (/P:<pw>);
+    # EOF=1 (optional) adds /EOF so a client's Ctrl-D disconnects that session.
     PWARG=""
     [ -n "$PW" ] && PWARG=" /P:$PW"
+    EOFARG=""
+    [ -n "$EOF" ] && EOFARG=" /EOF"
     if [ "$TRANSPORT" = ssh ]; then
-        printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHDS /SSH %s %s%s\r\n' \
-            "$GUEST_IP" "$PORT" "$PWARG" > AUTOEXEC.BAT
+        printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHDS /SSH %s %s%s%s\r\n' \
+            "$GUEST_IP" "$PORT" "$PWARG" "$EOFARG" > AUTOEXEC.BAT
     else
-        printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHD /NET %s %s%s\r\n' \
-            "$GUEST_IP" "$PORT" "$PWARG" > AUTOEXEC.BAT
+        printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHD /NET %s %s%s%s\r\n' \
+            "$GUEST_IP" "$PORT" "$PWARG" "$EOFARG" > AUTOEXEC.BAT
     fi
     mcopy -i dosshd.img -o PCNTPK.COM ::PCNTPK.COM
     ;;
 sshser)
     # SSH over COM1: no NIC/driver. QEMU bridges COM1 to a host TCP port, so a
     # stock `ssh` pointed at that port speaks SSH straight to the DOS box. PW
-    # (optional) sets the password (/P:<pw>).
+    # (optional) sets the password (/P:<pw>); EOF=1 adds /EOF (Ctrl-D disconnects).
     PWARG=""
     [ -n "$PW" ] && PWARG=" /P:$PW"
-    printf '@ECHO OFF\r\nDOSSHDS /SSH /COM%s\r\n' "$PWARG" > AUTOEXEC.BAT
+    EOFARG=""
+    [ -n "$EOF" ] && EOFARG=" /EOF"
+    printf '@ECHO OFF\r\nDOSSHDS /SSH /COM%s%s\r\n' "$PWARG" "$EOFARG" > AUTOEXEC.BAT
     ;;
 *)
     printf '@ECHO OFF\r\nDOSSHD\r\n' > AUTOEXEC.BAT
