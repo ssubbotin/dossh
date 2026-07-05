@@ -61,21 +61,32 @@ reach it from anywhere on the network.
 
 ## Connecting
 
+First get `DOSSHD` running on the DOS box and reachable over the network. The
+packet-driver / NIC bring-up for a real or emulated card — **including the
+NDIS2 + DIS_PKT stack used on real Realtek hardware** — is in
+**[docs/NETWORKING.md](docs/NETWORKING.md)**; start there.
+
 DOSSH mirrors a **fixed 80×25** DOS text screen at absolute cursor positions. It
 does **not** negotiate or adapt to your terminal size — unlike an ordinary telnet
-server, which serves a shell whose programs reflow to the window. So your client
-terminal must be **exactly 80×25**:
+server, which serves a shell whose programs reflow to the window — so your client
+terminal must be **exactly 80×25**. `DOSSHD /NET` listens on the telnet port
+(**23**) by default:
 
-- **Size it to 80×25 before connecting.** On xterm/gnome-terminal:
-  `printf '\e[8;25;80t'`, or set 80×25 in the terminal profile. Verify with
-  `tput lines` → it must print **25**. Most terminals default to **24 rows** (the
-  old VT100 height) — one short for DOS, which makes the bottom line collide (the
-  shell prompt lands on top of a program's last line of output).
-- **Connect** with any terminal: `telnet <host> <port>`, `nc <host> <port>`, or
-  PuTTY (raw/telnet).
-- **Disconnect** from the client — DOSSH is a transparent KVM with no in-band
-  commands, so `exit`/`Ctrl-D` go to DOS. Use `telnet` → `Ctrl-]` then `quit`;
-  `nc` → `Ctrl-C`; PuTTY → close the window.
+```sh
+printf '\e[8;25;80t'      # size the terminal to 25 rows × 80 cols
+tput lines                # confirm it prints 25
+telnet 127.0.0.1          # your DOS box's IP; nc / PuTTY work too
+```
+
+Most terminals default to **24 rows** (the old VT100 height) — one short for DOS,
+which makes the bottom line collide (the shell prompt lands on top of a program's
+last line of output), so the `printf`/`tput` step matters. If `tput lines` still
+shows 24, your terminal ignored the resize escape — set 80×25 via the window or
+the terminal profile instead.
+
+**Disconnect** from the client — DOSSH is a transparent KVM with no in-band
+commands, so `exit`/`Ctrl-D` go to DOS. Use `telnet` → `Ctrl-]` then `quit`;
+`nc` → `Ctrl-C`; PuTTY → close the window.
 
 DOSSH disables terminal auto-wrap for the session (so painting the bottom-right
 cell can't scroll the screen). If your *local* shell looks off after

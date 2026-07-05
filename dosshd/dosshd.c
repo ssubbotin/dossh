@@ -45,7 +45,7 @@
 /* transport: 0 = serial (COM1), 1 = TCP over a packet driver (net.c) */
 static int g_net;
 static unsigned char net_ip[4] = { 10, 0, 2, 15 };
-static unsigned      net_port  = 5555;
+static unsigned      net_port  = 23;      /* the telnet port, so `telnet <host>` works */
 
 /* ---- COM1 16550 UART, polled ---------------------------------------- */
 #define COM1      0x3F8
@@ -401,7 +401,7 @@ int main( int argc, char *argv[] )
                 net_port = (unsigned)atoi( argv[3] );
         } else {
             printf( "usage: DOSSHD                    install over serial (COM1)\n"
-                    "       DOSSHD /NET [ip] [port]   install over TCP (packet driver)\n"
+                    "       DOSSHD /NET [ip] [port]   install over TCP (port defaults to 23)\n"
                     "       DOSSHD /S                 status\n"
                     "       DOSSHD /U                 uninstall\n" );
             return 1;
