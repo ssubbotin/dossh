@@ -56,8 +56,17 @@ reach it from anywhere on the network.
 
 ## Components
 
-- **`DOSSHD.EXE`** — the DOS-side resident server (the "daemon"). It speaks
-  telnet/ANSI, so the client is whatever terminal you already have.
+Two builds ship — the same resident TSR console, differing only in the network
+transport and, as a result, the CPU they require:
+
+- **`DOSSHD.EXE`** — the telnet/ANSI server. The client is whatever terminal you
+  already have (`telnet`/`nc`/PuTTY). Runs on **any PC**: plain 16-bit real mode,
+  no CPU-specific instructions (an original **8086/8088** and up).
+- **`DOSSHDS.EXE`** — the same console over a real **SSH** server (experimental).
+  Needs a **Pentium (586) or later**: the vendored crypto compiles to 386 32-bit
+  instructions, and the entropy source uses `RDTSC`, a **586+** instruction — so
+  `586+` is the effective floor here, versus `8086+` for the telnet build. SSH
+  code lives only in this binary; `DOSSHD.EXE` is byte-for-byte unchanged.
 
 ## Connecting
 
