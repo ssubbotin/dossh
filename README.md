@@ -92,6 +92,10 @@ DOSSH disables terminal auto-wrap for the session (so painting the bottom-right
 cell can't scroll the screen). If your *local* shell looks off after
 disconnecting (long lines no longer wrapping), run `reset`.
 
+**Security:** the wire is plaintext telnet with no authentication yet — fine on a
+trusted, isolated LAN. On anything else, put it behind a tunnel (`ssh -L`, a VPN,
+or stunnel). See **[docs/SECURITY.md](docs/SECURITY.md)**.
+
 ## Roadmap
 
 - [x] **MVP:** foreground server, screen mirror, keyboard injection, a
