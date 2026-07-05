@@ -20,10 +20,24 @@
 set -e
 cd "$(dirname "$0")/.."
 
-DOSSHD=${DOSSHD:-dosshd/DOSSHD.EXE}
 PORT=${PORT:-5555}
 TRANSPORT=${TRANSPORT:-serial}
 GUEST_IP=${GUEST_IP:-10.0.2.15}
+# Prefer KVM (fast boot), fall back to TCG software emulation where KVM is
+# unavailable. Override with e.g. QEMU_ACCEL=tcg to force pure emulation.
+QEMU_ACCEL=${QEMU_ACCEL:-kvm:tcg}
+# TRANSPORT=ssh boots the SSH-enabled DOSSHDS.EXE (native in-DOS SSH server); it
+# rides the same PCnet packet driver + hostfwd path as pkt, but a stock `ssh`
+# client terminates the crypto on the DOS box. Needs a 386 (crypto) + 586 (rng
+# RDTSC), so it runs on a Pentium CPU.
+case "$TRANSPORT" in
+ssh|sshser)                             # SSH build (TCP or COM1)
+    DOSSHD=${DOSSHD:-dosshd/DOSSHDS.EXE}
+    EXE_NAME=DOSSHDS.EXE ;;
+*)
+    DOSSHD=${DOSSHD:-dosshd/DOSSHD.EXE}
+    EXE_NAME=DOSSHD.EXE ;;
+esac
 [ -f "$DOSSHD" ] || { echo "build first: (cd dosshd && ./build.sh)"; exit 1; }
 
 mkdir -p test/work && cd test/work
@@ -37,7 +51,16 @@ fi
 cp -f FLOPPY.img dosshd.img
 printf 'DOS=HIGH\r\nFILES=20\r\n' > FDCONFIG.SYS
 
-if [ "$TRANSPORT" = pkt ]; then
+# The SSH build (DOSSHDS.EXE) is ~130 KB but the FreeDOS install floppy has only
+# ~90 KB free. We never boot the installer, so drop its payload to make room.
+case "$TRANSPORT" in
+ssh|sshser)
+    mdeltree -i dosshd.img ::/FDSETUP >/dev/null 2>&1 || true
+    mdel     -i dosshd.img ::SETUP.BAT >/dev/null 2>&1 || true ;;
+esac
+
+case "$TRANSPORT" in
+pkt|ssh)
     # AMD PCnet DOS packet driver (PCNTPK.COM) for QEMU's emulated pcnet NIC.
     # A separate, freely-redistributable tool used only to bring the NIC up;
     # never linked into (MIT) DOSSHD. PCnet is chosen because its send_pkt is a
@@ -48,20 +71,35 @@ if [ "$TRANSPORT" = pkt ]; then
         curl -sSLo amdnic_2.zip "https://packetdriversdos.net/ZIP/amdnic_2.zip"
         unzip -oj amdnic_2.zip "PKTDRVR/PCNTPK.COM" >/dev/null
     fi
-    # load the packet driver at INT 0x60 (auto-detects the PCI NIC), then /NET.
-    # PW=<pw> (optional) gates the console with a password (/P:<pw>).
+    # load the packet driver at INT 0x60 (auto-detects the PCI NIC), then the
+    # server. PW=<pw> (optional) gates the console with a password (/P:<pw>).
     PWARG=""
     [ -n "$PW" ] && PWARG=" /P:$PW"
-    printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHD /NET %s %s%s\r\n' \
-        "$GUEST_IP" "$PORT" "$PWARG" > AUTOEXEC.BAT
+    if [ "$TRANSPORT" = ssh ]; then
+        printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHDS /SSH %s %s%s\r\n' \
+            "$GUEST_IP" "$PORT" "$PWARG" > AUTOEXEC.BAT
+    else
+        printf '@ECHO OFF\r\nPCNTPK INT=0x60\r\nDOSSHD /NET %s %s%s\r\n' \
+            "$GUEST_IP" "$PORT" "$PWARG" > AUTOEXEC.BAT
+    fi
     mcopy -i dosshd.img -o PCNTPK.COM ::PCNTPK.COM
-else
+    ;;
+sshser)
+    # SSH over COM1: no NIC/driver. QEMU bridges COM1 to a host TCP port, so a
+    # stock `ssh` pointed at that port speaks SSH straight to the DOS box. PW
+    # (optional) sets the password (/P:<pw>).
+    PWARG=""
+    [ -n "$PW" ] && PWARG=" /P:$PW"
+    printf '@ECHO OFF\r\nDOSSHDS /SSH /COM%s\r\n' "$PWARG" > AUTOEXEC.BAT
+    ;;
+*)
     printf '@ECHO OFF\r\nDOSSHD\r\n' > AUTOEXEC.BAT
-fi
+    ;;
+esac
 
 mcopy -i dosshd.img -o FDCONFIG.SYS ::FDCONFIG.SYS
 mcopy -i dosshd.img -o AUTOEXEC.BAT ::AUTOEXEC.BAT
-mcopy -i dosshd.img -o "../../$DOSSHD" ::DOSSHD.EXE
+mcopy -i dosshd.img -o "../../$DOSSHD" ::$EXE_NAME
 # direct-video test app, if built (used by e2e-m3, handy for demos)
 if [ -f ../VIDTEST.EXE ]; then
     mcopy -i dosshd.img -o ../VIDTEST.EXE ::VIDTEST.EXE
@@ -72,15 +110,30 @@ fi
 MONARG=""
 [ -n "$MON" ] && MONARG="-monitor unix:$MON,server,nowait"
 
-if [ "$TRANSPORT" = pkt ]; then
-    echo "QEMU: PCnet + DOSSHD /NET, host tcp:127.0.0.1:$PORT -> guest $GUEST_IP:$PORT"
-    exec qemu-system-i386 -m 16 -fda dosshd.img -boot a \
+case "$TRANSPORT" in
+pkt|ssh)
+    # SSH crypto needs a 386 (Monocypher -3) and rng needs RDTSC (586), so boot
+    # the SSH build on a Pentium. pkt (telnet) stays on the default CPU.
+    CPUARG=""
+    [ "$TRANSPORT" = ssh ] && CPUARG="-cpu pentium2"
+    echo "QEMU: PCnet + $EXE_NAME, host tcp:127.0.0.1:$PORT -> guest $GUEST_IP:$PORT"
+    exec qemu-system-i386 -machine accel=$QEMU_ACCEL -m 16 $CPUARG -fda dosshd.img -boot a \
         -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-$GUEST_IP:$PORT" \
         -device "pcnet,netdev=n0,mac=52:54:00:12:34:56" \
         -display none -vga std $MONARG
-else
-    echo "QEMU: COM1 -> tcp:127.0.0.1:$PORT  (connect with telnet/nc)"
-    exec qemu-system-i386 -m 16 -fda dosshd.img -boot a \
+    ;;
+sshser)
+    # SSH over COM1, bridged to a host TCP port. Same 386/586 CPU requirement as
+    # the network SSH build. A stock `ssh` connects to the bridged port.
+    echo "QEMU: COM1(SSH) -> tcp:127.0.0.1:$PORT  (ssh to this port)"
+    exec qemu-system-i386 -machine accel=$QEMU_ACCEL -m 16 -cpu pentium2 -fda dosshd.img -boot a \
         -serial "tcp:127.0.0.1:$PORT,server,nowait" \
         -display none -vga std $MONARG
-fi
+    ;;
+*)
+    echo "QEMU: COM1 -> tcp:127.0.0.1:$PORT  (connect with telnet/nc)"
+    exec qemu-system-i386 -machine accel=$QEMU_ACCEL -m 16 -fda dosshd.img -boot a \
+        -serial "tcp:127.0.0.1:$PORT,server,nowait" \
+        -display none -vga std $MONARG
+    ;;
+esac

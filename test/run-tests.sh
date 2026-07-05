@@ -54,6 +54,15 @@ for t in e2e-m5a e2e-m5b e2e-m5c e2e-m5-multiclient e2e-auth e2e-naws e2e-m5d-re
     python3 "test/$t.py" || { echo "FAILED: $t"; exit 1; }
 done
 
+# Native in-DOS SSH acceptance test (the P1 milestone): a stock `ssh` client
+# drives a FreeDOS console whose SSH crypto terminates on the DOS box. Boots the
+# SSH-enabled DOSSHDS.EXE under QEMU (Pentium CPU) and connects a real ssh
+# client. Self-skips if ssh/sshpass/DOSSHDS are absent. Set SSH_TRANSPORT=sshser
+# to exercise the same server over COM1 (a serial-bridge) where QEMU user-net is
+# unavailable.
+echo "-- e2e-ssh-dos --"
+python3 test/e2e-ssh-dos.py || { echo "FAILED: e2e-ssh-dos"; exit 1; }
+
 # Opt-in NDIS2/DIS_PKT smoke test - builds a net floppy with net/mkbootdisk.sh
 # and drives DOSSHD over an emulated NIC. Skips unless DOSSH_DRIVERS is set (the
 # DOS networking stack is vendor-supplied; see docs/NETWORKING.md).

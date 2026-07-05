@@ -1,6 +1,13 @@
 # DESIGN — SSH server mode for DOSSH (research + options)
 
-**Status: research / design proposal. Nothing here is built.** This document
+**Status: P1 BUILT and proven (experimental).** Native in-DOS SSH — architecture
+B below — now works end to end: a stock `ssh` client authenticates and drives a
+real-mode DOS box over an encrypted session that terminates *on the box*
+(`curve25519-sha256` + `ssh-ed25519` + `chacha20-poly1305@openssh.com`, computed
+from the timer ISR), shipped in the separate `DOSSHDS.EXE` build and proven by
+`test/e2e-ssh-dos.py`. It is single-client and carries the DOS-entropy caveat of
+§6, so it ships EXPERIMENTAL; P2 (publickey) and P3 (multi-client) remain. The
+rest of this document is the original research/design that led there. This document
 exists so the maintainer can decide *whether* and *how* to give DOSSH a real SSH
 server, so a DOS box can be reached with a stock `ssh` client instead of
 plaintext telnet. It ends with an explicit decisions list.

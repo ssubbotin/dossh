@@ -42,10 +42,44 @@
 #include "ansikey.h"
 #include "telnet.h"
 
+#ifdef DOSSH_SSH
+/* SSH server variant (built medium-model -3; see build.sh). Everything SSH is
+ * guarded by DOSSH_SSH so the default 8086 DOSSHD.EXE is byte-for-byte
+ * unchanged. ssh.h/rng.h pull in the __far crypto primitives. */
+#include "ssh.h"
+#include "rng.h"
+#endif
+
 /* transport: 0 = serial (COM1), 1 = TCP over a packet driver (net.c) */
 static int g_net;
 static unsigned char net_ip[4] = { 10, 0, 2, 15 };
 static unsigned      net_port  = 23;      /* the telnet port, so `telnet <host>` works */
+
+#ifdef DOSSH_SSH
+/* ---- SSH server state (resident, DGROUP) ---------------------------------
+ * P1: a single SSH session bound to one net.c slot (multi-client SSH is P3).
+ * The transport/framing is ssh.c where telnet.c sits on the net path; the same
+ * TCP stack (net.c) carries it. */
+static int          g_ssh_mode;             /* 1 = SSH transport                 */
+static int          g_ssh_serial;           /* 1 = SSH over COM1, else over net   */
+static int          g_ssh_ser_started;      /* serial: a session is in progress   */
+static ssh_conn     g_ssh;                  /* the one SSH connection            */
+static int          g_ssh_slot = -1;        /* net slot bound to it, -1 = idle   */
+static unsigned char g_hostkey_sk[64];      /* resident ed25519 host key         */
+static unsigned char g_hostkey_pk[32];
+static char         g_ssh_pw[64];           /* configured password (empty = open) */
+static int          g_ssh_have_pw;
+static int          g_ssh_cols = 80, g_ssh_rows = 25;   /* last client window     */
+static unsigned     g_ssh_stir;             /* rolling ISR entropy sample        */
+static int          g_ssh_stack_op;         /* dispatcher: 0 = tick, 1 = install  */
+
+extern void ssh_run_on_stack( void );       /* sshtramp.asm: private-stack shim  */
+void        ssh_stack_dispatch( void );     /* the shim calls this (extern)      */
+static void ssh_worker( void );
+static void ssh_net_worker( void );
+static void ssh_serial_worker( void );
+static void ssh_install_setup( void );
+#endif
 
 /* ---- COM1 16550 UART, polled ---------------------------------------- */
 #define COM1      0x3F8
@@ -205,11 +239,225 @@ static void net_tick( void )
     }
 }
 
+#ifdef DOSSH_SSH
+/* ---- SSH tick worker -------------------------------------------------------
+ * Runs on a private DGROUP stack (see sshtramp.asm) so the medium-model crypto's
+ * near-data stack buffers resolve correctly at interrupt time (SS == DS). It is
+ * the SSH analogue of net_tick: net_poll drives TCP, ssh.c is the per-connection
+ * framing, and the render/ansikey layers above it are untouched (they see
+ * decrypted bytes, just as telnet sees post-IAC bytes). */
+
+/* drain ssh_output() to the bound slot's TCP send ring, bounded by ring room so
+ * no encrypted byte is ever dropped - leftover stays queued inside ssh's ob. */
+static void ssh_pump_output( int slot )
+{
+    unsigned char buf[128];
+    unsigned room, n, k;
+
+    for( ;; ) {
+        room = (unsigned)net_tx_room_slot( slot );
+        if( room == 0 ) break;
+        if( room > sizeof( buf ) ) room = sizeof( buf );
+        n = ssh_output( &g_ssh, buf, room );
+        if( n == 0 ) break;
+        for( k = 0; k < n; k++ )
+            net_tx_putc_slot( slot, buf[k] );  /* fits: bounded by room above */
+    }
+}
+
+/* pull render bytes and stage them as SSH channel data (mirrors tx_pump); the
+ * channel's return-0-when-full paces the shared stream exactly like the net path */
+static void ssh_tx_pump( void )
+{
+    unsigned budget = TX_BUDGET;
+
+    while( budget-- ) {
+        int b = render_next_byte( 0 );         /* network cadence (serial=0) */
+        if( b < 0 )
+            break;
+        if( !ssh_channel_putc( &g_ssh, b ) ) { /* staging buffer full */
+            render_pushback( b );              /* ... resume next tick */
+            break;
+        }
+    }
+}
+
+/* dispatch the tick worker to the active SSH transport (both run on the private
+ * stack, so the crypto's stack buffers are near-correct) */
+static void ssh_worker( void )
+{
+    if( g_ssh_serial )
+        ssh_serial_worker();
+    else
+        ssh_net_worker();
+}
+
+static void ssh_net_worker( void )
+{
+    int i, b;
+
+    net_poll();                                /* rx + tcp + retransmit */
+
+    /* new TCP connections: bind the first to the single P1 SSH session and hand
+       it our version string + KEXINIT; reject the rest (multi-client SSH is P3). */
+    while( ( i = net_take_new_slot() ) >= 0 ) {
+        if( g_ssh_slot < 0 || i == g_ssh_slot ) {
+            g_ssh_slot = i;
+            ssh_reset( &g_ssh, g_hostkey_sk, g_hostkey_pk );
+            if( g_ssh_have_pw )
+                ssh_set_password( &g_ssh, g_ssh_pw );
+            g_ssh_cols = 80; g_ssh_rows = 25;
+            render_reset();                    /* first channel data repaints */
+            ssh_pump_output( g_ssh_slot );     /* SSH-2.0-... + KEXINIT        */
+        } else {
+            net_slot_drop( i );
+        }
+    }
+
+    if( g_ssh_slot < 0 )
+        return;
+    if( !net_slot_connected( g_ssh_slot ) ) {  /* peer went away: free the session */
+        g_ssh_slot = -1;
+        return;
+    }
+
+    /* inbound SSH wire bytes -> the state machine (which queues any replies) */
+    {
+        unsigned char rb[512];
+        unsigned rn = 0;
+        while( rn < sizeof( rb ) && ( b = net_rx_getc( g_ssh_slot ) ) >= 0 ) {
+            rng_stir( (unsigned)b ^ g_ssh_stir++ );   /* fold arrival jitter */
+            rb[rn++] = (unsigned char)b;
+        }
+        if( rn )
+            ssh_input( &g_ssh, rb, rn );
+    }
+    ssh_pump_output( g_ssh_slot );             /* handshake / protocol replies */
+
+    if( ssh_channel_ready( &g_ssh ) ) {        /* shell granted: byte pipe is up */
+        int cols, rows;
+        ssh_winsize( &g_ssh, &cols, &rows );   /* SSH's NAWS equivalent */
+        if( cols != g_ssh_cols || rows != g_ssh_rows ) {
+            g_ssh_cols = cols; g_ssh_rows = rows;
+            render_reset();                    /* client resized: full repaint */
+        }
+        while( ( b = ssh_channel_getc( &g_ssh ) ) >= 0 )
+            ansi_key_byte( (unsigned char)b );  /* keystrokes -> BIOS ring (+ reboot sentinel) */
+        ssh_tx_pump();                          /* screen -> channel staging */
+        ssh_channel_flush( &g_ssh );            /* frame + encrypt as CHANNEL_DATA */
+        ssh_pump_output( g_ssh_slot );
+    }
+
+    /* teardown: peer closed the channel / sent DISCONNECT, or a fatal error */
+    if( ssh_channel_closed( &g_ssh ) || ssh_failed( &g_ssh )
+        || g_ssh.state == SSH_ST_CLOSED ) {
+        ssh_pump_output( g_ssh_slot );          /* push any final bytes first */
+        net_slot_drop( g_ssh_slot );
+        g_ssh_slot = -1;
+    }
+
+    rng_stir( g_ssh_stir++ );                   /* continuous stir in the ISR */
+}
+
+/* ---- SSH over COM1 --------------------------------------------------------
+ * The same ssh.c transport, but the byte stream is the 16550 UART instead of
+ * net.c. Point-to-point, so there is no connection event: the server can't
+ * speak first. We wait for the client's first bytes (its "SSH-" version line),
+ * then ssh_reset (which queues our version + KEXINIT) and feed them in. Under
+ * QEMU a `-serial tcp:...,server` bridge makes this reachable by a stock `ssh`
+ * pointed at the bridged port - the SSH crypto still terminates on the DOS box. */
+
+/* drain ssh_output() onto COM1, bounded per tick to keep the ISR budget */
+static void ssh_serial_pump_output( void )
+{
+    unsigned char buf[128];
+    unsigned n, k, budget = 1024;
+
+    while( budget ) {
+        unsigned take = budget < sizeof( buf ) ? budget : sizeof( buf );
+        n = ssh_output( &g_ssh, buf, take );
+        if( n == 0 )
+            break;
+        for( k = 0; k < n; k++ ) {
+            unsigned guard = 0;
+            while( ( inp( U_LSR ) & 0x20 ) == 0 )   /* wait for THR empty */
+                if( ++guard > 60000U ) break;       /* no peer: don't hang */
+            outp( U_THR, buf[k] );
+        }
+        budget -= n;
+    }
+}
+
+static void ssh_serial_worker( void )
+{
+    unsigned char rb[256];
+    unsigned rn = 0;
+    int b;
+
+    while( rn < sizeof( rb ) && ( inp( U_LSR ) & 0x01 ) ) {   /* RX ready */
+        b = inp( U_RBR );
+        rng_stir( (unsigned)b ^ g_ssh_stir++ );
+        rb[rn++] = (unsigned char)b;
+    }
+
+    if( rn ) {
+        /* start (or restart, after a prior session ended/errored) on first bytes */
+        if( !g_ssh_ser_started || g_ssh.state == SSH_ST_ERROR
+            || g_ssh.state == SSH_ST_CLOSED ) {
+            ssh_reset( &g_ssh, g_hostkey_sk, g_hostkey_pk );
+            if( g_ssh_have_pw )
+                ssh_set_password( &g_ssh, g_ssh_pw );
+            g_ssh_cols = 80; g_ssh_rows = 25;
+            g_ssh_ser_started = 1;
+            render_reset();
+        }
+        ssh_input( &g_ssh, rb, rn );
+    }
+
+    if( !g_ssh_ser_started )
+        return;
+
+    ssh_serial_pump_output();                  /* handshake / protocol replies */
+
+    if( ssh_channel_ready( &g_ssh ) ) {
+        int cols, rows;
+        ssh_winsize( &g_ssh, &cols, &rows );
+        if( cols != g_ssh_cols || rows != g_ssh_rows ) {
+            g_ssh_cols = cols; g_ssh_rows = rows;
+            render_reset();
+        }
+        while( ( b = ssh_channel_getc( &g_ssh ) ) >= 0 )
+            ansi_key_byte( (unsigned char)b );
+        ssh_tx_pump();
+        ssh_channel_flush( &g_ssh );
+        ssh_serial_pump_output();
+    }
+
+    rng_stir( g_ssh_stir++ );
+}
+
+/* Called by the private-stack shim (sshtramp.asm). Runs either the per-tick SSH
+ * worker or, once at install, the entropy gather + host-key generation - both on
+ * the deep private stack (the crypto needs it). */
+void ssh_stack_dispatch( void )
+{
+    if( g_ssh_stack_op )
+        ssh_install_setup();
+    else
+        ssh_worker();
+}
+#endif /* DOSSH_SSH */
+
 static void __interrupt __far tick_isr( void )
 {
     if( !in_tick ) {
         in_tick = 1;
         ansi_key_tick();                      /* flush a pending lone ESC */
+#ifdef DOSSH_SSH
+        if( g_ssh_mode )
+            ssh_run_on_stack();               /* SSH work, on a private DGROUP stack */
+        else
+#endif
         if( g_net ) {
             net_tick();
         } else {
@@ -274,6 +522,46 @@ static struct resident_state __far *find_resident( int *conflict )
     return NULL;
 }
 
+#ifdef DOSSH_SSH
+/* Load the persistent ed25519 host key from DOSSHD.KEY (a 32-byte seed in the
+ * current directory) or generate + persist one on first install. Read-only
+ * media: the freshly generated key is used for this boot only (warned). This is
+ * the foreground path, so ordinary DOS file I/O is fine. */
+static void ssh_load_hostkey( void )
+{
+    unsigned char seed[32];
+    FILE *f;
+    int have = 0;
+
+    f = fopen( "DOSSHD.KEY", "rb" );
+    if( f ) {
+        if( fread( seed, 1, 32, f ) == 32 )
+            have = 1;
+        fclose( f );
+    }
+    if( !have ) {
+        rng_bytes( seed, 32 );                /* CSPRNG (rng_init already ran) */
+        f = fopen( "DOSSHD.KEY", "wb" );
+        if( f ) {
+            fwrite( seed, 1, 32, f );
+            fclose( f );
+            printf( "DOSSHD: generated a new ed25519 host key (DOSSHD.KEY).\n" );
+        } else {
+            printf( "DOSSHD: WARNING - could not write DOSSHD.KEY;"
+                    " host key is ephemeral this boot.\n" );
+        }
+    }
+    dossh_ed25519_key_pair( g_hostkey_sk, g_hostkey_pk, seed );  /* wipes seed */
+}
+
+/* one-time install setup, run on the deep private stack via the shim */
+static void ssh_install_setup( void )
+{
+    rng_init();                               /* gather entropy + seed the DRBG */
+    ssh_load_hostkey();                       /* persistent ed25519 host key    */
+}
+#endif
+
 static int install( void )
 {
     unsigned short psp = get_psp();
@@ -281,6 +569,14 @@ static int install( void )
 
     ansi_key_init();                          /* build the keystroke tables */
     render_reset();                           /* first tick paints the screen */
+
+#ifdef DOSSH_SSH
+    if( g_ssh_mode ) {
+        g_ssh_stack_op = 1;                   /* run rng_init + keygen on the    */
+        ssh_run_on_stack();                   /* deep private stack (SS==DS here) */
+        g_ssh_stack_op = 0;                   /* ... ticks use the worker path   */
+    }
+#endif
 
     if( g_net ) {
         if( !net_open( net_ip[0], net_ip[1], net_ip[2], net_ip[3],
@@ -310,6 +606,20 @@ static int install( void )
     }
 
     paras = block_paras( psp );
+#ifdef DOSSH_SSH
+    if( g_ssh_mode && g_ssh_serial )
+        printf( "DOSSHD SSH (EXPERIMENTAL) - resident SSH console on COM1 (115200 8N1),\n"
+                "  ed25519 host key, %s auth, %u KB kept.  `ssh` the bridged port; DOSSHD /U removes it.\n",
+                g_ssh_have_pw ? "password" : "open (no /P)",
+                (unsigned)(((unsigned long)paras * 16 + 1023) / 1024) );
+    else if( g_ssh_mode )
+        printf( "DOSSHD SSH (EXPERIMENTAL) - resident SSH console on TCP %u.%u.%u.%u:%u,\n"
+                "  ed25519 host key, %s auth, %u KB kept.  `ssh -p %u user@host`; DOSSHD /U removes it.\n",
+                net_ip[0], net_ip[1], net_ip[2], net_ip[3], net_port,
+                g_ssh_have_pw ? "password" : "open (no /P)",
+                (unsigned)(((unsigned long)paras * 16 + 1023) / 1024), net_port );
+    else
+#endif
     if( g_net )
         printf( "DOSSHD M4 - resident console over TCP %u.%u.%u.%u:%u via %02X:%02X:%02X:%02X:%02X:%02X,\n"
                 "  %u KB kept.  Connect a client; DOSSHD /U removes it.\n",
@@ -417,6 +727,38 @@ int main( int argc, char *argv[] )
     if( argc > 1 ) {
         if( opt_is( argv[1], "U" ) ) return uninstall();
         if( opt_is( argv[1], "S" ) ) return status();
+#ifdef DOSSH_SSH
+        if( opt_is( argv[1], "SSH" ) ) {      /* SSH server: same TCP path, ssh.c framing */
+            int ai, pos = 0;                  /* positional args: 0 = ip, 1 = port */
+            g_ssh_mode = 1;
+            g_net      = 1;                   /* SSH rides the net.c TCP stack */
+            net_port   = 22;                  /* default to the SSH port */
+            for( ai = 2; ai < argc; ai++ ) {
+                char *a = argv[ai];
+                if( ( a[0] == '/' || a[0] == '-' )
+                    && ( a[1] == 'P' || a[1] == 'p' ) && a[2] == ':' ) {
+                    unsigned k = 0;           /* /P:<pw> -> ssh_set_password later */
+                    const char *pw = a + 3;
+                    while( pw[k] && k < sizeof( g_ssh_pw ) - 1 ) { g_ssh_pw[k] = pw[k]; k++; }
+                    g_ssh_pw[k] = 0;
+                    g_ssh_have_pw = ( k > 0 );
+                } else if( opt_is( a, "COM" ) || opt_is( a, "COM1" )
+                           || stricmp( a, "COM1" ) == 0 ) {
+                    g_ssh_serial = 1;         /* SSH over the COM1 serial line */
+                    g_net        = 0;
+                } else if( pos == 0 ) {
+                    if( !parse_ip( a, net_ip ) ) {
+                        printf( "DOSSHD: bad IP '%s'\n", a );
+                        return 1;
+                    }
+                    pos = 1;
+                } else if( pos == 1 ) {
+                    net_port = (unsigned)atoi( a );
+                    pos = 2;
+                }
+            }
+        } else
+#endif
         if( opt_is( argv[1], "NET" ) ) {
             int ai, pos = 0;                  /* positional args: 0 = ip, 1 = port */
             g_net = 1;
@@ -442,6 +784,11 @@ int main( int argc, char *argv[] )
                     "                                        /P: gates with a password)\n"
                     "       DOSSHD /S                    status\n"
                     "       DOSSHD /U                    uninstall\n" );
+#ifdef DOSSH_SSH
+            printf( "       DOSSHD /SSH [ip] [port] [/P:pw]  install as an SSH server over TCP\n"
+                    "       DOSSHD /SSH /COM [/P:pw]         install as an SSH server over COM1\n"
+                    "                                        (EXPERIMENTAL; port 22; /P: sets the password)\n" );
+#endif
             return 1;
         }
     }

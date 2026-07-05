@@ -61,7 +61,7 @@ CRYPTO_SRC="crypto/monocypher.c crypto/monocypher-ed25519.c crypto/sha256.c cryp
 CRYPTO_OBJ=""
 for f in $CRYPTO_SRC; do
     o="${f%.c}.o"
-    wcc -zq -bt=dos -mm -3 -os -zastd=c99 -dDOSSH_SSH_SUBSET -i=crypto -fo="$o" "$f"
+    wcc -zq -bt=dos -mm -3 -os -s -zastd=c99 -dDOSSH_SSH_SUBSET -i=crypto -fo="$o" "$f"
     CRYPTO_OBJ="$CRYPTO_OBJ $o"
 done
 
@@ -83,14 +83,37 @@ cp -f cryptot.exe CRYPTOT.EXE 2>/dev/null || true
 # the DOS target (mixed -mm/-3 image), matching how a future SSH-enabled DOSSHD
 # would build. The FUNCTIONAL interop proof is native: test/sshd_native.c drives
 # the same ssh.c against a stock OpenSSH client (test/e2e-ssh-transport.sh).
-wcc -zq -bt=dos -mm -3 -os -zastd=c99 -dDOSSH_SSH_SUBSET -i=crypto -fo=ssh.o ssh.c
+wcc -zq -bt=dos -mm -3 -os -s -zastd=c99 -dDOSSH_SSH_SUBSET -i=crypto -fo=ssh.o ssh.c
 wcl -zq -bcl=dos -mm -3 -os -dDOSSH_SSH_SUBSET -i=. -i=crypto \
     -fe=sshlink.exe ../test/sshlink.c ssh.o $CRYPTO_OBJ
 cp -f sshlink.exe SSHLINK.EXE 2>/dev/null || true
+
+# ---- SSH-enabled DOSSHD (DOSSHDS.EXE) - the payoff build -----------------
+# The resident TSR with ssh.c wired into the timer tick, so a stock `ssh` client
+# reaches the real DOS console (docs/DESIGN-ssh.md sec 3B). It must share one
+# image with the -mm -3 crypto, so the whole thing is medium-model 386: the base
+# sources are recompiled -mm -3 -dDOSSH_SSH and linked with ssh.o, the crypto/rng
+# objects, a medium-model pktrecv, and sshtramp.asm - the private-stack shim that
+# makes SS==DS==DGROUP for the ISR-time crypto (its callees use their own stack,
+# unlike net.c's static ISR buffers). Every SSH line in the base .c files is
+# #ifdef DOSSH_SSH, so the DEFAULT small/8086 DOSSHD.EXE above stays byte-for-byte
+# identical. Runtime needs a 386 (crypto) + 586 (rng's RDTSC): run on QEMU with
+# `-cpu pentium` or later.
+wasm -zq -dMEDIUM_MODEL=1 -fo=pktrecvm.obj pktrecv.asm
+wasm -zq -dMEDIUM_MODEL=1 -fo=sshtramp.obj  sshtramp.asm
+SSHD_OBJ=""
+for f in dosshd net render cp437 ansikey telnet; do
+    wcc -zq -bt=dos -mm -3 -os -s -zastd=c99 -dDOSSH_SSH -dDOSSH_SSH_SUBSET \
+        -i=crypto -fo="$f-ssh.o" "$f.c"
+    SSHD_OBJ="$SSHD_OBJ $f-ssh.o"
+done
+wcl -zq -bcl=dos -mm -3 -os -fm=dosshds.map \
+    -fe=dosshds.exe $SSHD_OBJ ssh.o $CRYPTO_OBJ pktrecvm.obj sshtramp.obj
+cp -f dosshds.exe DOSSHDS.EXE 2>/dev/null || true
 
 # VIDTEST: direct-video test fixture / demo app (see ../test/vidtest.c)
 (cd ../test && wcl -zq -bcl=dos -ms -0 -os -fe=vidtest.exe vidtest.c \
     && cp -f vidtest.exe VIDTEST.EXE)
 
-ls -l dosshd.exe DOSSHD.EXE CRYPTOT.EXE SSHLINK.EXE ../test/VIDTEST.EXE 2>/dev/null
-echo "built dosshd/DOSSHD.EXE, dosshd/CRYPTOT.EXE, dosshd/SSHLINK.EXE and test/VIDTEST.EXE"
+ls -l dosshd.exe DOSSHD.EXE DOSSHDS.EXE CRYPTOT.EXE SSHLINK.EXE ../test/VIDTEST.EXE 2>/dev/null
+echo "built dosshd/DOSSHD.EXE, dosshd/DOSSHDS.EXE, dosshd/CRYPTOT.EXE, dosshd/SSHLINK.EXE and test/VIDTEST.EXE"

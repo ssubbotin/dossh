@@ -117,6 +117,22 @@ screen or keyboard), but no encryption, so on anything other than a trusted,
 isolated LAN put it behind a tunnel (`ssh -L`, a VPN, or stunnel) — the password
 itself is cleartext otherwise. See **[docs/SECURITY.md](docs/SECURITY.md)**.
 
+**Native SSH (experimental).** A separate build, `DOSSHDS.EXE`, runs a real SSH
+server *inside* the TSR, so a stock `ssh` client reaches the DOS box with real
+end-to-end encryption — no tunnel needed:
+
+```sh
+DOSSHDS /SSH <ip> <port> /P:<password>     # on the DOS box (needs a 586+ CPU)
+ssh -p <port> user@<dos-box-ip>            # from anywhere, with a stock ssh
+```
+
+It speaks `curve25519-sha256` + `ssh-ed25519` + `chacha20-poly1305@openssh.com`,
+all computed on the DOS box from the timer tick. **Experimental / pre-1.0:** it is
+single-client, and DOS has no OS entropy source, so its keys are weaker than a
+real OS RNG (see [docs/DESIGN-ssh.md](docs/DESIGN-ssh.md)) — for a hardened setup
+the tunnel above is still the conservative choice. The default `DOSSHD.EXE`
+(telnet, 8086-compatible) is unchanged; SSH lives only in `DOSSHDS.EXE`.
+
 ## Roadmap
 
 - [x] **MVP:** foreground server, screen mirror, keyboard injection, a
@@ -141,7 +157,14 @@ itself is cleartext otherwise. See **[docs/SECURITY.md](docs/SECURITY.md)**.
 - [x] **Password authentication** — an optional gate before the console
       (`DOSSHD /NET <ip> <port> /P:<pw>`): a client is prompted and sees neither
       screen nor keyboard until it authenticates. `test/e2e-auth.py` proves it.
-- [ ] Optional transport encryption (today: tunnel it — see docs/SECURITY.md).
+- [x] **Native SSH server (experimental)** — a stock `ssh` client connects
+      straight to the DOS box with real end-to-end encryption (curve25519 +
+      ed25519 + chacha20-poly1305), terminating in the TSR from the timer tick.
+      Single-client (P1) in the separate `DOSSHDS.EXE` build; `test/e2e-ssh-dos.py`
+      drives a real OpenSSH client against a DOS box in QEMU.
+- [ ] SSH: publickey auth (P2), multi-client encryption (P3).
+- [x] Transport encryption — the native SSH build above, or a tunnel
+      (`ssh -L` / VPN / stunnel — see docs/SECURITY.md).
 
 ## Building & testing
 

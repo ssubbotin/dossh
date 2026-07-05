@@ -669,6 +669,27 @@ void net_tx_flush( void )
         tcp_output( &conns[i] );
 }
 
+#ifdef DOSSH_SSH
+/* SSH build only (keeps the base net.c object byte-identical). The SSH worker
+ * drives one specific slot, so it needs a per-slot "still connected?" check and
+ * the slot's free send-ring room (to drain ssh_output without dropping bytes). */
+int net_slot_connected( int i )
+{
+    return i >= 0 && i < NCONN && conns[i].tstate == TS_ESTAB;
+}
+
+int net_tx_room_slot( int i )
+{
+    struct conn *c;
+    unsigned used;
+    if( i < 0 || i >= NCONN )
+        return 0;
+    c = &conns[i];
+    used = (c->s_end - c->s_una) & SND_MASK;
+    return (int)( (SND_SZ - 1) - used );
+}
+#endif
+
 int net_rx_getc( int i )
 {
     struct conn *c;

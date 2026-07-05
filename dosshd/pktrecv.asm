@@ -16,7 +16,15 @@
 ;
 ; MIT License. Copyright (c) 2026 Sergey Subbotin.
 
+; The SSH-enabled DOSSHD is built medium model (far code) to sit in the same
+; image as the -mm crypto; assemble with -dMEDIUM_MODEL for that build so the
+; C-visible routines become far calls. The default (no define) is the small
+; model the base 8086 DOSSHD links, byte-for-byte unchanged.
+IFDEF MEDIUM_MODEL
+.model medium
+ELSE
 .model small
+ENDIF
 .8086
 
 BS_STK_SZ       equ     4096
@@ -89,7 +97,11 @@ pkt_receiver_   endp
 ; 1Ch no-ops, and the receive upcall only touches pkt_stage, never g_txbuf. The
 ; BIOS INT 08h's own trailing EOI is then a harmless second non-specific EOI.
         public  pkt_send_bigstack_
+IFDEF MEDIUM_MODEL
+pkt_send_bigstack_ proc far
+ELSE
 pkt_send_bigstack_ proc near
+ENDIF
         cli
         mov     bs_ss, ss             ; DS = DGROUP
         mov     bs_sp, sp

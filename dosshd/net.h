@@ -55,4 +55,9 @@ int  net_rx_getc( int i );         /* next byte received from slot i, or -1     
 void net_slot_ready( int i, int v );/* admit (1) / un-admit (0) a slot to broadcast */
 void net_slot_drop( int i );       /* reject a slot: abort the session, re-LISTEN  */
 
+#ifdef DOSSH_SSH
+int  net_slot_connected( int i );  /* 1 if slot i's TCP session is ESTABLISHED     */
+int  net_tx_room_slot( int i );    /* free bytes in slot i's TCP send ring          */
+#endif
+
 #endif
