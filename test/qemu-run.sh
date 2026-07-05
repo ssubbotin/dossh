@@ -100,6 +100,16 @@ esac
 mcopy -i dosshd.img -o FDCONFIG.SYS ::FDCONFIG.SYS
 mcopy -i dosshd.img -o AUTOEXEC.BAT ::AUTOEXEC.BAT
 mcopy -i dosshd.img -o "../../$DOSSHD" ::$EXE_NAME
+# Optional authorized_keys for SSH publickey auth: AUTHKEYS_SRC points at a host
+# file in OpenSSH authorized_keys format; it is dropped next to the EXE so
+# DOSSHDS finds AUTHKEYS in its working directory and enables publickey userauth.
+case "$TRANSPORT" in
+ssh|sshser)
+    if [ -n "$AUTHKEYS_SRC" ] && [ -f "$AUTHKEYS_SRC" ]; then
+        mcopy -i dosshd.img -o "$AUTHKEYS_SRC" ::AUTHKEYS
+        echo "QEMU: publickey auth enabled (AUTHKEYS from $AUTHKEYS_SRC)"
+    fi ;;
+esac
 # direct-video test app, if built (used by e2e-m3, handy for demos)
 if [ -f ../VIDTEST.EXE ]; then
     mcopy -i dosshd.img -o ../VIDTEST.EXE ::VIDTEST.EXE

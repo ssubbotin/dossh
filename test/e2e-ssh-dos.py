@@ -3,13 +3,15 @@
 End-to-end test for native in-DOS SSH (the P1 milestone): a stock `ssh` client
 drives a real FreeDOS console whose SSH crypto runs on the DOS box itself.
 
-Boots the SSH-enabled DOSSHDS.EXE (DOSSHD /SSH ... /P:<pw>) on an emulated PCnet
-NIC under QEMU with a Pentium CPU (the crypto needs a 386, rng's RDTSC a 586),
-and connects with a real OpenSSH client through QEMU user-net hostfwd - the whole
-SSH transport + password userauth + session channel terminates on DOS, in the
-timer tick. Asserts:
+Boots the SSH-enabled DOSSHDS.EXE (DOSSHD /SSH ...) on an emulated PCnet NIC
+under QEMU with a Pentium CPU (the crypto needs a 386, rng's RDTSC a 586), and
+connects with a real OpenSSH client through QEMU user-net hostfwd - the whole
+SSH transport + userauth + session channel terminates on DOS, in the timer tick.
+By default (SSH_AUTH=publickey, the P2 milestone) the box loads an AUTHKEYS file
+and `ssh -i <key>` authenticates by publickey with NO password on the wire; set
+SSH_AUTH=password for the original password path. Asserts:
 
-  * a real `ssh` authenticates with the password and opens a shell channel;
+  * a real `ssh` authenticates (publickey by default) and opens a shell channel;
   * the DOS screen arrives over the encrypted channel and decodes to the FreeDOS
     prompt;
   * typing `echo BANANA<CR>` reaches DOS and its output shows on the screen.
@@ -26,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -40,31 +43,47 @@ PW = os.environ.get("SSH_PW", "dosbanana")
 # functionally identical to a stock ssh client, and the only path usable where
 # QEMU's user-mode networking is unavailable (e.g. some sandboxes).
 SSH_TRANSPORT = os.environ.get("SSH_TRANSPORT", "ssh")
+# "publickey" (default, the P2 milestone): the box also loads an AUTHKEYS file
+# and a stock `ssh -i <key>` authenticates with NO password on the wire.
+# "password": the original P1 path (sshpass drives password userauth).
+SSH_AUTH = os.environ.get("SSH_AUTH", "publickey")
 BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "240"))
 PROMPT_TIMEOUT = int(os.environ.get("PROMPT_TIMEOUT", "60"))
 ECHO_TIMEOUT = int(os.environ.get("ECHO_TIMEOUT", "45"))
+
+# Set in main() for publickey mode: the client's private key the box authorizes.
+KEYFILE = None
 
 SSH_OPTS = [
     "-tt",
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "PreferredAuthentications=password",
-    "-o", "PubkeyAuthentication=no",
     "-o", "NumberOfPasswordPrompts=1",
     "-o", "ConnectTimeout=6",
     "-o", "LogLevel=ERROR",
 ]
 
+# publickey: offer ONLY our -i key (no agent), so the box's authorized key is
+# what lets us in and nothing else. password: the original sshpass path.
+PW_OPTS = ["-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no"]
+PK_OPTS = ["-o", "PreferredAuthentications=publickey", "-o", "PubkeyAuthentication=yes",
+           "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none"]
+
 
 class SshSession:
-    """One `sshpass ... ssh` attempt with a background stdout reader that feeds
-    an AnsiGrid. sshpass wires ssh's stdin/stdout through a pty it relays, so
+    """One `ssh` attempt with a background stdout reader that feeds an AnsiGrid.
+    In publickey mode ssh authenticates with our -i key (no password ever sent);
+    in password mode sshpass relays the password through ssh's pty. Either way,
     writing to our stdin reaches the remote channel and ssh's screen output
     reaches our grid."""
 
     def __init__(self):
-        cmd = ["sshpass", "-p", PW, "ssh"] + SSH_OPTS + [
-            "-p", str(PORT), "user@127.0.0.1"]
+        if SSH_AUTH == "publickey":
+            cmd = ["ssh"] + SSH_OPTS + PK_OPTS + [
+                "-i", KEYFILE, "-p", str(PORT), "user@127.0.0.1"]
+        else:
+            cmd = ["sshpass", "-p", PW, "ssh"] + SSH_OPTS + PW_OPTS + [
+                "-p", str(PORT), "user@127.0.0.1"]
         self.p = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, bufsize=0, preexec_fn=os.setsid)
@@ -162,19 +181,37 @@ def connect(deadline):
 
 
 def main():
+    global KEYFILE
     if not shutil.which("ssh"):
         print("SKIP: no ssh client binary found", file=sys.stderr)
         return 0
     if not shutil.which("sshpass"):
         print("SKIP: sshpass not found", file=sys.stderr)
         return 0
+    if SSH_AUTH == "publickey" and not shutil.which("ssh-keygen"):
+        print("SKIP: ssh-keygen not found (needed for publickey mode)", file=sys.stderr)
+        return 0
     if not os.path.exists(os.path.join(ROOT, "dosshd", "DOSSHDS.EXE")):
         print("SKIP: DOSSHDS.EXE not built (run dosshd/build.sh)", file=sys.stderr)
         return 0
 
+    tmp = tempfile.mkdtemp(prefix="dossh-ssh-dos-")
+    qenv = dict(os.environ, PORT=str(PORT), TRANSPORT=SSH_TRANSPORT, PW=PW)
+    if SSH_AUTH == "publickey":
+        # Generate a throwaway ed25519 key and authorize its public half by
+        # dropping id.pub onto the boot floppy as AUTHKEYS. The box then admits
+        # `ssh -i id` by publickey with NO password on the wire.
+        KEYFILE = os.path.join(tmp, "id_dos")
+        subprocess.check_call(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", KEYFILE,
+             "-C", "dossh-e2e@publickey"])
+        authkeys = os.path.join(tmp, "AUTHKEYS")
+        shutil.copyfile(KEYFILE + ".pub", authkeys)
+        qenv["AUTHKEYS_SRC"] = authkeys
+
     qemu = subprocess.Popen(
         ["bash", os.path.join(ROOT, "test", "qemu-run.sh")],
-        env=dict(os.environ, PORT=str(PORT), TRANSPORT=SSH_TRANSPORT, PW=PW),
+        env=qenv,
         stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
         preexec_fn=os.setsid)
     s = None
@@ -184,8 +221,8 @@ def main():
             print("e2e-ssh-dos: FAIL - no ssh session ever authenticated",
                   file=sys.stderr)
             return 1
-        print("e2e-ssh-dos: ok - real ssh authenticated (password) and the "
-              "channel is up")
+        print("e2e-ssh-dos: ok - real ssh authenticated (%s) and the "
+              "channel is up" % SSH_AUTH)
 
         if not wait(lambda: s.contains(":\\>"), PROMPT_TIMEOUT):
             print("e2e-ssh-dos: FAIL - no FreeDOS prompt in the decrypted ANSI",
@@ -215,6 +252,7 @@ def main():
         except (ProcessLookupError, PermissionError):
             pass
         qemu.wait()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

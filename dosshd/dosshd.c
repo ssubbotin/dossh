@@ -69,6 +69,9 @@ static unsigned char g_hostkey_sk[64];      /* resident ed25519 host key        
 static unsigned char g_hostkey_pk[32];
 static char         g_ssh_pw[64];           /* configured password (empty = open) */
 static int          g_ssh_have_pw;
+#define SSH_MAX_AUTHKEYS 8                   /* a handful fits the DGROUP budget   */
+static unsigned char g_authkeys[SSH_MAX_AUTHKEYS][32]; /* authorized ed25519 keys */
+static unsigned      g_authkey_count;       /* loaded from AUTHKEYS at install    */
 static int          g_ssh_cols = 80, g_ssh_rows = 25;   /* last client window     */
 static unsigned     g_ssh_stir;             /* rolling ISR entropy sample        */
 static int          g_ssh_stack_op;         /* dispatcher: 0 = tick, 1 = install  */
@@ -306,6 +309,10 @@ static void ssh_net_worker( void )
             ssh_reset( &g_ssh, g_hostkey_sk, g_hostkey_pk );
             if( g_ssh_have_pw )
                 ssh_set_password( &g_ssh, g_ssh_pw );
+            if( g_authkey_count )
+                ssh_set_authorized_keys( &g_ssh,
+                                         (const unsigned char *)g_authkeys,
+                                         g_authkey_count );
             g_ssh_cols = 80; g_ssh_rows = 25;
             render_reset();                    /* first channel data repaints */
             ssh_pump_output( g_ssh_slot );     /* SSH-2.0-... + KEXINIT        */
@@ -407,6 +414,10 @@ static void ssh_serial_worker( void )
             ssh_reset( &g_ssh, g_hostkey_sk, g_hostkey_pk );
             if( g_ssh_have_pw )
                 ssh_set_password( &g_ssh, g_ssh_pw );
+            if( g_authkey_count )
+                ssh_set_authorized_keys( &g_ssh,
+                                         (const unsigned char *)g_authkeys,
+                                         g_authkey_count );
             g_ssh_cols = 80; g_ssh_rows = 25;
             g_ssh_ser_started = 1;
             render_reset();
@@ -554,11 +565,38 @@ static void ssh_load_hostkey( void )
     dossh_ed25519_key_pair( g_hostkey_sk, g_hostkey_pk, seed );  /* wipes seed */
 }
 
+/* Load authorized ed25519 public keys from AUTHKEYS (an OpenSSH authorized_keys
+ * file next to the EXE) at install. Each accepted line contributes one raw
+ * 32-byte key to the resident set; publickey userauth (RFC 4252 sec 7) then lets
+ * a matching client in with no secret on the wire. Absent file => publickey
+ * simply unavailable and password auth still works. Foreground path (like the
+ * host key), so ordinary DOS file I/O is fine. ssh-ed25519 only: the crypto
+ * library has no RSA. */
+static void ssh_load_authkeys( void )
+{
+    char line[300];                           /* one authorized_keys line       */
+    FILE *f;
+
+    g_authkey_count = 0;
+    f = fopen( "AUTHKEYS", "r" );
+    if( !f )
+        return;                               /* no file: publickey unavailable */
+    while( g_authkey_count < SSH_MAX_AUTHKEYS && fgets( line, sizeof( line ), f ) ) {
+        if( ssh_parse_authkey_line( line, g_authkeys[g_authkey_count] ) )
+            g_authkey_count++;
+    }
+    fclose( f );
+    if( g_authkey_count )
+        printf( "DOSSHD: loaded %u authorized ed25519 key(s) from AUTHKEYS.\n",
+                g_authkey_count );
+}
+
 /* one-time install setup, run on the deep private stack via the shim */
 static void ssh_install_setup( void )
 {
     rng_init();                               /* gather entropy + seed the DRBG */
     ssh_load_hostkey();                       /* persistent ed25519 host key    */
+    ssh_load_authkeys();                      /* authorized publickeys (AUTHKEYS) */
 }
 #endif
 
@@ -607,18 +645,23 @@ static int install( void )
 
     paras = block_paras( psp );
 #ifdef DOSSH_SSH
+    {
+    const char *authdesc =
+        g_authkey_count ? ( g_ssh_have_pw ? "publickey+password" : "publickey" )
+                        : ( g_ssh_have_pw ? "password"           : "open (no /P)" );
     if( g_ssh_mode && g_ssh_serial )
         printf( "DOSSHD SSH (EXPERIMENTAL) - resident SSH console on COM1 (115200 8N1),\n"
                 "  ed25519 host key, %s auth, %u KB kept.  `ssh` the bridged port; DOSSHD /U removes it.\n",
-                g_ssh_have_pw ? "password" : "open (no /P)",
+                authdesc,
                 (unsigned)(((unsigned long)paras * 16 + 1023) / 1024) );
     else if( g_ssh_mode )
         printf( "DOSSHD SSH (EXPERIMENTAL) - resident SSH console on TCP %u.%u.%u.%u:%u,\n"
                 "  ed25519 host key, %s auth, %u KB kept.  `ssh -p %u user@host`; DOSSHD /U removes it.\n",
                 net_ip[0], net_ip[1], net_ip[2], net_ip[3], net_port,
-                g_ssh_have_pw ? "password" : "open (no /P)",
+                authdesc,
                 (unsigned)(((unsigned long)paras * 16 + 1023) / 1024), net_port );
     else
+    {
 #endif
     if( g_net )
         printf( "DOSSHD M4 - resident console over TCP %u.%u.%u.%u:%u via %02X:%02X:%02X:%02X:%02X:%02X,\n"
@@ -630,6 +673,10 @@ static int install( void )
         printf( "DOSSHD M3 - resident console on COM1 (115200 8N1), %u KB kept.\n"
                 "Screen is mirrored and remote keys injected until DOSSHD /U.\n",
                 (unsigned)(((unsigned long)paras * 16 + 1023) / 1024) );
+#ifdef DOSSH_SSH
+    }                                         /* non-SSH transport branch */
+    }                                         /* authdesc scope           */
+#endif
     _dos_keep( 0, paras );                    /* stay resident; no return */
     return 0;                                 /* not reached */
 }

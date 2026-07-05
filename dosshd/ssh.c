@@ -39,6 +39,7 @@
 #define MSG_USERAUTH_FAILURE 51
 #define MSG_USERAUTH_SUCCESS 52
 #define MSG_USERAUTH_BANNER  53
+#define MSG_USERAUTH_PK_OK   60   /* publickey probe accepted (RFC 4252 sec 7) */
 /* connection protocol (RFC 4254) */
 #define MSG_GLOBAL_REQUEST           80
 #define MSG_REQUEST_SUCCESS          81
@@ -471,10 +472,23 @@ static void handle_service_request(ssh_conn *c, const uint8_t *pl, unsigned plen
 
 static void send_userauth_failure(ssh_conn *c)
 {
-	uint8_t rep[40];
-	unsigned o = 0;
+	uint8_t rep[64];
+	char methods[32];
+	unsigned o = 0, m = 0;
+
+	/* Advertise exactly the methods that can still authenticate, so a client
+	 * with an authorized key tries publickey (and never puts a secret on the
+	 * wire) while password still works otherwise. */
+	if (c->authkey_count) { memcpy(methods + m, "publickey", 9); m += 9; }
+	if (c->have_password) {
+		if (m) methods[m++] = ',';
+		memcpy(methods + m, "password", 8); m += 8;
+	}
+	if (m == 0) { memcpy(methods, "password", 8); m = 8; }  /* never empty */
+	methods[m] = 0;
+
 	rep[o++] = MSG_USERAUTH_FAILURE;
-	o += put_nl(rep + o, "password");   /* methods that can still continue */
+	o += put_nl(rep + o, methods);      /* methods that can still continue */
 	rep[o++] = 0;                       /* partial success = FALSE          */
 	send_packet(c, rep, o);
 }
@@ -509,33 +523,197 @@ static void auth_reject(ssh_conn *c, int count_it)
 		send_userauth_failure(c);
 }
 
+/*
+ * Bounds-checked SSH string reader: at *po, read a uint32 length then that many
+ * bytes, all within [0,plen). On success returns 1 with the pointer/length set
+ * and *po advanced; on any overrun returns 0, leaving the caller to reject. Every
+ * length field from the wire flows through here so nothing is ever read out of
+ * bounds - the arithmetic can't wrap (o <= plen is an invariant, and the body
+ * length is compared in 32-bit before it is narrowed). */
+static int rd_string(const uint8_t *pl, unsigned plen, unsigned *po,
+                     const uint8_t **s, unsigned *slen)
+{
+	unsigned o = *po;
+	uint32_t L;
+	if (o > plen || plen - o < 4) return 0;
+	L = rd_u32(pl + o);
+	if (L > (uint32_t)(plen - o - 4)) return 0;   /* body must fit the packet */
+	o += 4;
+	*s = pl + o;
+	*slen = (unsigned)L;                          /* L <= plen: fits 16-bit    */
+	o += (unsigned)L;
+	*po = o;
+	return 1;
+}
+
+/* Pull the raw 32-byte ed25519 public key out of an "ssh-ed25519" key blob
+ * (string("ssh-ed25519") string(key32)). Returns a pointer to the 32 key bytes
+ * inside blob, or 0 if the blob is malformed / not exactly this shape. */
+static const uint8_t *ed25519_key_from_blob(const uint8_t *blob, unsigned bloblen)
+{
+	unsigned o = 0, klen;
+	const uint8_t *name, *key;
+	unsigned nlen;
+	if (!rd_string(blob, bloblen, &o, &name, &nlen)) return 0;
+	if (nlen != 11 || memcmp(name, "ssh-ed25519", 11) != 0) return 0;
+	if (!rd_string(blob, bloblen, &o, &key, &klen)) return 0;
+	if (klen != 32) return 0;
+	return key;
+}
+
+/* Pull the raw 64-byte ed25519 signature out of a signature blob
+ * (string("ssh-ed25519") string(sig64)). Returns a pointer to the 64 sig bytes,
+ * or 0 if malformed / wrong algorithm / wrong length. */
+static const uint8_t *ed25519_sig_from_blob(const uint8_t *sb, unsigned sblen)
+{
+	unsigned o = 0, glen;
+	const uint8_t *name, *sig;
+	unsigned nlen;
+	if (!rd_string(sb, sblen, &o, &name, &nlen)) return 0;
+	if (nlen != 11 || memcmp(name, "ssh-ed25519", 11) != 0) return 0;
+	if (!rd_string(sb, sblen, &o, &sig, &glen)) return 0;
+	if (glen != 64) return 0;
+	return sig;
+}
+
+/* Is this 32-byte ed25519 public key in the configured authorized set? Keys are
+ * public, so a plain compare is fine (no secret-dependent timing here). */
+static int authkey_is_authorized(ssh_conn *c, const uint8_t *key)
+{
+	unsigned i;
+	for (i = 0; i < c->authkey_count; i++)
+		if (memcmp(c->authkeys + (unsigned)i * 32, key, 32) == 0)
+			return 1;
+	return 0;
+}
+
+/* SSH_MSG_USERAUTH_PK_OK: echo the offered algorithm name + key blob so the
+ * client knows this key is acceptable and proceeds to sign (RFC 4252 sec 7). */
+static void send_pk_ok(ssh_conn *c, const uint8_t *algo, unsigned algolen,
+                       const uint8_t *blob, unsigned bloblen)
+{
+	uint8_t rep[128];
+	unsigned o = 0;
+	if (1 + 4 + algolen + 4 + bloblen > sizeof(rep)) { auth_reject(c, 1); return; }
+	rep[o++] = MSG_USERAUTH_PK_OK;
+	o += put_str(rep + o, algo, algolen);
+	o += put_str(rep + o, blob, bloblen);
+	send_packet(c, rep, o);
+}
+
+/*
+ * Reconstruct, into g_scratch, the exact byte string a publickey signature is
+ * computed over (RFC 4252 sec 7):
+ *   string(session_id) byte(SSH_MSG_USERAUTH_REQUEST) string(user)
+ *   string(service) string("publickey") boolean(TRUE)
+ *   string(pubkey-algorithm) string(pubkey-blob)
+ * The user/service/algo/blob bytes are used verbatim as the client sent them.
+ * g_scratch (>= 3 KB) is free after key exchange, so no extra DGROUP is spent.
+ * Returns the length written. */
+static unsigned build_pk_signed_data(ssh_conn *c,
+        const uint8_t *user, unsigned ulen,
+        const uint8_t *service, unsigned slen,
+        const uint8_t *algo, unsigned algolen,
+        const uint8_t *blob, unsigned bloblen)
+{
+	unsigned o = 0;
+	o += put_str(g_scratch + o, c->session_id, 32);
+	g_scratch[o++] = MSG_USERAUTH_REQUEST;
+	o += put_str(g_scratch + o, user, ulen);
+	o += put_str(g_scratch + o, service, slen);
+	o += put_str(g_scratch + o, (const uint8_t *)"publickey", 9);
+	g_scratch[o++] = 1;                              /* boolean TRUE */
+	o += put_str(g_scratch + o, algo, algolen);
+	o += put_str(g_scratch + o, blob, bloblen);
+	return o;
+}
+
+/*
+ * publickey userauth (RFC 4252 sec 7), ssh-ed25519 only. o is the packet offset
+ * just past the "publickey" method name (i.e. at the boolean). Two forms:
+ *   probe  (boolean FALSE, no signature): reply PK_OK iff the offered key is
+ *          authorized, else FAILURE. A probe NEVER grants authentication.
+ *   signed (boolean TRUE, with a signature): grant SUCCESS iff the key is
+ *          authorized AND the ed25519 signature verifies over the session-bound
+ *          data above; otherwise FAILURE. Both conditions must hold.
+ */
+static void handle_pubkey_auth(ssh_conn *c, const uint8_t *pl, unsigned plen,
+                               unsigned o,
+                               const uint8_t *user, unsigned ulen,
+                               const uint8_t *service, unsigned slen)
+{
+	const uint8_t *algo, *blob, *key, *sigblob, *rawsig;
+	unsigned algolen, bloblen, siglen, dlen;
+	uint8_t have_sig;
+	int authorized;
+
+	if (o + 1 > plen) { auth_reject(c, 1); return; }
+	have_sig = pl[o++];
+	if (!rd_string(pl, plen, &o, &algo, &algolen)) { auth_reject(c, 1); return; }
+	if (!rd_string(pl, plen, &o, &blob, &bloblen)) { auth_reject(c, 1); return; }
+
+	/* ssh-ed25519 is the only publickey algorithm we implement (the crypto lib
+	 * has no RSA); anything else fails cleanly so the client can fall back. */
+	if (algolen != 11 || memcmp(algo, "ssh-ed25519", 11) != 0) {
+		auth_reject(c, 1); return;
+	}
+	key = ed25519_key_from_blob(blob, bloblen);
+	if (!key) { auth_reject(c, 1); return; }
+
+	authorized = authkey_is_authorized(c, key);
+
+	if (!have_sig) {                    /* PROBE: PK_OK only, never SUCCESS */
+		if (!authorized) { auth_reject(c, 1); return; }
+		send_pk_ok(c, algo, algolen, blob, bloblen);
+		return;
+	}
+
+	/* Signed request: the signature blob follows the key blob. */
+	if (!rd_string(pl, plen, &o, &sigblob, &siglen)) { auth_reject(c, 1); return; }
+	rawsig = ed25519_sig_from_blob(sigblob, siglen);
+	if (!rawsig) { auth_reject(c, 1); return; }
+
+	/* Authorization AND a valid signature over the session-bound data must both
+	 * hold. Verifying the offered key's own signature is not enough - the key
+	 * must also be in the authorized set. */
+	if (!authorized) { auth_reject(c, 1); return; }
+	dlen = build_pk_signed_data(c, user, ulen, service, slen,
+	                            algo, algolen, blob, bloblen);
+	if (dossh_ed25519_verify(rawsig, key, g_scratch, dlen) == 0)
+		send_userauth_success(c);
+	else
+		auth_reject(c, 1);
+}
+
 static void handle_userauth_request(ssh_conn *c, const uint8_t *pl, unsigned plen)
 {
 	unsigned o = 1, ulen, slen, mlen, k;
-	const uint8_t *user, *method;
+	const uint8_t *user, *service, *method;
 
-	if (o + 4 > plen) { fail(c, "short USERAUTH_REQUEST"); return; }
-	ulen = rd_u32(pl + o); o += 4; user = pl + o; o += ulen;
-	if (o + 4 > plen) { fail(c, "bad USERAUTH_REQUEST"); return; }
-	slen = rd_u32(pl + o); o += 4; o += slen;            /* service name (skip) */
-	if (o + 4 > plen) { fail(c, "bad USERAUTH_REQUEST"); return; }
-	mlen = rd_u32(pl + o); o += 4; method = pl + o; o += mlen;
-	if (o > plen) { fail(c, "bad USERAUTH_REQUEST"); return; }
+	if (!rd_string(pl, plen, &o, &user, &ulen))    { fail(c, "short USERAUTH_REQUEST"); return; }
+	if (!rd_string(pl, plen, &o, &service, &slen)) { fail(c, "bad USERAUTH_REQUEST"); return; }
+	if (!rd_string(pl, plen, &o, &method, &mlen))  { fail(c, "bad USERAUTH_REQUEST"); return; }
 
 	k = ulen < sizeof(c->auth_user) - 1 ? ulen : sizeof(c->auth_user) - 1;
 	memcpy(c->auth_user, user, k); c->auth_user[k] = 0;
 
-	/* Open box (no /P equivalent): admit the first attempt, any method. */
-	if (!c->have_password) { send_userauth_success(c); return; }
+	/* Open box (no /P equivalent, no authorized keys): admit the first attempt,
+	 * any method. Once a password OR authorized keys are configured, the box is
+	 * gated and only a matching credential authenticates. */
+	if (!c->have_password && !c->authkey_count) { send_userauth_success(c); return; }
 
-	if (mlen == 8 && memcmp(method, "password", 8) == 0) {
+	if (mlen == 9 && memcmp(method, "publickey", 9) == 0) {
+		if (!c->authkey_count) { auth_reject(c, 1); return; }  /* not offered */
+		handle_pubkey_auth(c, pl, plen, o, user, ulen, service, slen);
+		return;
+	}
+
+	if (c->have_password && mlen == 8 && memcmp(method, "password", 8) == 0) {
 		unsigned pwlen, want;
 		const uint8_t *pw;
 		if (o + 1 > plen) { auth_reject(c, 1); return; }
 		if (pl[o++]) { auth_reject(c, 1); return; }  /* change-password: no */
-		if (o + 4 > plen) { auth_reject(c, 1); return; }
-		pwlen = rd_u32(pl + o); o += 4; pw = pl + o;
-		if (o + pwlen > plen) { auth_reject(c, 1); return; }
+		if (!rd_string(pl, plen, &o, &pw, &pwlen)) { auth_reject(c, 1); return; }
 		want = (unsigned)strlen(c->password);
 		if (pwlen == want && memcmp(pw, c->password, want) == 0)
 			send_userauth_success(c);
@@ -545,7 +723,7 @@ static void handle_userauth_request(ssh_conn *c, const uint8_t *pl, unsigned ple
 	}
 
 	/* "none" is the client's probe for the method list - don't spend the retry
-	 * budget on it; publickey/other do count (publickey is P2, refuse to pw). */
+	 * budget on it; any other unsupported method counts. */
 	auth_reject(c, !(mlen == 4 && memcmp(method, "none", 4) == 0));
 }
 
@@ -897,6 +1075,82 @@ void DOSSH_FAR ssh_set_password(ssh_conn *c, const char *pw)
 		while (pw[k] && k < sizeof(c->password) - 1) { c->password[k] = pw[k]; k++; }
 	c->password[k] = 0;
 	c->have_password = (k > 0);
+}
+
+void DOSSH_FAR ssh_set_authorized_keys(ssh_conn *c, const uint8_t *keys,
+                                       unsigned count)
+{
+	c->authkeys = keys;                 /* [count][32] ed25519 public keys */
+	c->authkey_count = count;
+}
+
+/* base64 value of one character, or -1 if it is not a base64 digit */
+static int b64val(int ch)
+{
+	if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+	if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+	if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+	if (ch == '+') return 62;
+	if (ch == '/') return 63;
+	return -1;
+}
+
+/* Decode base64 (no embedded whitespace, optional trailing '=' padding) into
+ * out[0..outmax). Returns the number of bytes decoded, or 0 on any malformed
+ * input / overflow. */
+static unsigned b64_decode(const char *in, unsigned inlen,
+                           uint8_t *out, unsigned outmax)
+{
+	unsigned i = 0, o = 0;
+	while (inlen && in[inlen - 1] == '=') inlen--;   /* drop pad from the view */
+	while (i < inlen) {
+		unsigned rem = inlen - i;
+		int c0 = b64val(in[i]);
+		int c1 = (rem > 1) ? b64val(in[i + 1]) : -1;
+		int c2 = (rem > 2) ? b64val(in[i + 2]) : -1;
+		int c3 = (rem > 3) ? b64val(in[i + 3]) : -1;
+		if (c0 < 0 || c1 < 0) return 0;              /* a lone trailing char */
+		if (o >= outmax) return 0;
+		out[o++] = (uint8_t)((c0 << 2) | (c1 >> 4));
+		if (rem == 2) break;
+		if (c2 < 0) return 0;
+		if (o >= outmax) return 0;
+		out[o++] = (uint8_t)((c1 << 4) | (c2 >> 2));
+		if (rem == 3) break;
+		if (c3 < 0) return 0;
+		if (o >= outmax) return 0;
+		out[o++] = (uint8_t)((c2 << 6) | c3);
+		i += 4;
+	}
+	return o;
+}
+
+int DOSSH_FAR ssh_parse_authkey_line(const char *line, uint8_t pubkey[32])
+{
+	const char *p = line;
+	const char *b64;
+	unsigned b64len = 0;
+	uint8_t blob[80];                    /* an ssh-ed25519 blob is 51 bytes */
+	unsigned bloblen;
+	const uint8_t *key;
+
+	while (*p == ' ' || *p == '\t') p++;             /* leading whitespace */
+	if (*p == 0 || *p == '#' || *p == '\r' || *p == '\n') return 0;  /* blank/comment */
+
+	/* must be "ssh-ed25519" followed by whitespace (ssh-ed25519 only) */
+	if (strlen(p) < 11 || memcmp(p, "ssh-ed25519", 11) != 0) return 0;
+	p += 11;
+	if (*p != ' ' && *p != '\t') return 0;
+	while (*p == ' ' || *p == '\t') p++;
+
+	b64 = p;                                          /* the base64 key blob */
+	while (b64val(*p) >= 0 || *p == '=') { p++; b64len++; }
+
+	bloblen = b64_decode(b64, b64len, blob, sizeof(blob));
+	key = ed25519_key_from_blob(blob, bloblen);       /* validates the shape */
+	if (!key) return 0;
+	memcpy(pubkey, key, 32);
+	return 1;
 }
 
 int DOSSH_FAR ssh_authenticated(ssh_conn *c) { return c->authenticated; }

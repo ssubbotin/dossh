@@ -21,12 +21,15 @@
  * ssh_channel_putc / ssh_channel_flush push encrypted screen bytes, mirroring
  * the net_rx_getc / net_tx_putc / net_tx_flush shape the telnet path uses.
  *
- * Auth policy (mirrors telnet's "no /P = open"): if ssh_set_password() has NOT
- * been called (or is set empty), the server accepts the client's first auth
- * attempt of any method (open box). If a password IS configured, only the SSH
- * "password" method with a matching secret authenticates; "none"/"publickey"
- * and wrong passwords get SSH_MSG_USERAUTH_FAILURE listing "password", and
- * after a few failures the server sends SSH_MSG_DISCONNECT. Publickey is P2.
+ * Auth policy (mirrors telnet's "no /P = open"): if neither ssh_set_password()
+ * nor ssh_set_authorized_keys() has been called (open box), the server accepts
+ * the client's first auth attempt of any method. Once a password and/or
+ * authorized keys are configured, the box is gated: "publickey" (RFC 4252 sec 7,
+ * ssh-ed25519 only) authenticates a client whose key is in the authorized set
+ * and whose signature verifies over the session-bound data - no secret ever
+ * crosses the wire; "password" authenticates a matching secret. Failures get
+ * SSH_MSG_USERAUTH_FAILURE listing the still-available methods
+ * ("publickey,password"), and after a few the server sends SSH_MSG_DISCONNECT.
  *
  * NOTE: no libc dependency beyond memcpy/memset/memmove/memcmp/strlen. Crypto
  * comes through the __far crypto.h / rng.h primitives, so this compiles both
@@ -132,6 +135,12 @@ typedef struct ssh_conn {
 	int          authenticated;  /* 1 after SSH_MSG_USERAUTH_SUCCESS            */
 	unsigned     auth_fails;     /* wrong/rejected attempts (retry budget)      */
 	char         auth_user[64];  /* last requested user name (informational)    */
+	/* publickey auth (RFC 4252 sec 7): a pointer to the caller's persistent
+	 * [authkey_count][32] array of authorized ed25519 public keys (near data,
+	 * shared DGROUP), so the 32-byte keys are stored once, not per connection.
+	 * Empty => publickey unavailable. */
+	const uint8_t *authkeys;
+	unsigned       authkey_count;
 
 	/* ---- connection / session channel (RFC 4254) -------------------- */
 	int          chan_open;      /* a "session" channel is open                */
@@ -184,8 +193,23 @@ const char * DOSSH_FAR ssh_state_name(ssh_conn *c);
 
 /* Configure the password checked by SSH "password" auth (mirrors
  * telnet_set_password). Call AFTER ssh_reset (which zeroes the struct). An
- * empty/NULL string leaves the box open: the first auth attempt is accepted. */
+ * empty/NULL string leaves the box open: the first auth attempt is accepted
+ * (unless authorized keys are configured, which also gates the box). */
 void DOSSH_FAR ssh_set_password(ssh_conn *c, const char *pw);
+
+/* Configure the authorized ed25519 public keys for "publickey" auth (RFC 4252
+ * sec 7). keys points at a persistent [count][32] byte array (raw 32-byte
+ * ed25519 public keys) that must outlive the connection; ssh_conn keeps only
+ * the pointer + count. Call AFTER ssh_reset. count == 0 (or never called)
+ * leaves publickey unavailable. */
+void DOSSH_FAR ssh_set_authorized_keys(ssh_conn *c, const uint8_t *keys,
+                                       unsigned count);
+
+/* Parse one OpenSSH authorized_keys line ("ssh-ed25519 <base64blob> [comment]")
+ * into a raw 32-byte ed25519 public key. Returns 1 on success (pubkey filled),
+ * 0 for a blank/comment/non-ed25519/malformed line. ssh-ed25519 only (the
+ * crypto library has no RSA). */
+int DOSSH_FAR ssh_parse_authkey_line(const char *line, uint8_t pubkey[32]);
 
 /* 1 once userauth has succeeded. */
 int DOSSH_FAR ssh_authenticated(ssh_conn *c);

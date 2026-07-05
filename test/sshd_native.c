@@ -21,6 +21,11 @@
  * transport. This is what test/e2e-ssh-shell.sh drives. Exit 0 iff a shell was
  * granted (i.e. auth succeeded and the channel came up).
  *
+ * --authkeys=<file>: load an OpenSSH authorized_keys file (ssh-ed25519 lines)
+ * and enable publickey userauth (RFC 4252 sec 7). Implies --shell. Combine with
+ * --pass to allow both methods (a client with an authorized key skips the
+ * password; others fall back to it). This is what test/e2e-ssh-pubkey.sh drives.
+ *
  * MIT License. Copyright (c) 2026 Sergey Subbotin.
  */
 #include <stdio.h>
@@ -78,6 +83,9 @@ int main(int argc, char **argv)
 	int port, ls, cs, one = 1, last_state, kex_logged = 0;
 	int shell_mode = 0, service_logged = 0, banner_sent = 0;
 	const char *password = NULL;
+	const char *authkeys_file = NULL;
+	uint8_t authkeys[16][32];
+	unsigned authkey_count = 0;
 	struct sockaddr_in sa;
 	uint8_t hostkey_sk[64], hostkey_pk[32], seed[32];
 	uint8_t rseed[32];
@@ -86,13 +94,31 @@ int main(int argc, char **argv)
 	int i;
 
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <port> [--shell] [--pass=<pw>]\n", argv[0]);
+		fprintf(stderr, "usage: %s <port> [--shell] [--pass=<pw>] "
+		                "[--authkeys=<file>]\n", argv[0]);
 		return 2;
 	}
 	port = atoi(argv[1]);
 	for (i = 2; i < argc; i++) {
 		if (strncmp(argv[i], "--pass=", 7) == 0) { password = argv[i] + 7; shell_mode = 1; }
+		else if (strncmp(argv[i], "--authkeys=", 11) == 0) { authkeys_file = argv[i] + 11; shell_mode = 1; }
 		else if (strcmp(argv[i], "--shell") == 0) shell_mode = 1;
+	}
+
+	/* Load the authorized ed25519 keys (OpenSSH authorized_keys format) using
+	 * the same parser the DOS build uses, so publickey userauth is exercised
+	 * against exactly the resident code path. */
+	if (authkeys_file) {
+		FILE *ak = fopen(authkeys_file, "r");
+		char line[512];
+		if (!ak) { fprintf(stderr, "cannot open authkeys %s\n", authkeys_file); return 2; }
+		while (authkey_count < 16 && fgets(line, sizeof(line), ak)) {
+			if (ssh_parse_authkey_line(line, authkeys[authkey_count]))
+				authkey_count++;
+		}
+		fclose(ak);
+		printf("loaded %u authorized ed25519 key(s) from %s\n",
+		       authkey_count, authkeys_file);
 	}
 
 	/* Seed the CSPRNG from the OS so server ephemerals are real (this is the
@@ -136,7 +162,12 @@ int main(int argc, char **argv)
 	if (password) {
 		ssh_set_password(&c, password);
 		printf("password auth enabled\n");
-	} else if (shell_mode) {
+	}
+	if (authkey_count) {
+		ssh_set_authorized_keys(&c, (const uint8_t *)authkeys, authkey_count);
+		printf("publickey auth enabled (%u key(s))\n", authkey_count);
+	}
+	if (!password && !authkey_count && shell_mode) {
 		printf("open box (no password: first auth attempt admitted)\n");
 	}
 	last_state = c.state;

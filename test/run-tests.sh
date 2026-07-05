@@ -20,6 +20,8 @@ if [ "$1" = "ssh" ]; then
     bash test/e2e-ssh-transport.sh
     echo "== ssh userauth + session-channel interop (real OpenSSH client) =="
     bash test/e2e-ssh-shell.sh
+    echo "== ssh publickey userauth interop (real OpenSSH client) =="
+    bash test/e2e-ssh-pubkey.sh
     echo "== ssh targets passed =="
     exit 0
 fi
@@ -76,5 +78,8 @@ bash test/e2e-ssh-transport.sh || { echo "FAILED: ssh transport interop"; exit 1
 
 echo "== ssh userauth + session-channel interop (real OpenSSH client) =="
 bash test/e2e-ssh-shell.sh || { echo "FAILED: ssh userauth+channel interop"; exit 1; }
+
+echo "== ssh publickey userauth interop (real OpenSSH client) =="
+bash test/e2e-ssh-pubkey.sh || { echo "FAILED: ssh publickey userauth interop"; exit 1; }
 
 echo "== all tests passed =="
