@@ -17,6 +17,15 @@ echo "== unit: server key map (test_ansikey.c) =="
 cc -o "$BIN" dosshd/ansikey.c test/test_ansikey.c
 "$BIN"
 
+echo "== unit: crypto known-answer tests (test_crypto.c) =="
+CBIN="${TMPDIR:-/tmp}/dossh-test-crypto"
+# Same crypto .c files the DOS build uses; DOSSH_SSH_SUBSET matches build.sh so
+# the vendored Monocypher subset is identical on host and target.
+cc -O2 -DDOSSH_SSH_SUBSET -Idosshd/crypto -o "$CBIN" \
+    test/test_crypto.c dosshd/crypto/crypto.c dosshd/crypto/sha256.c \
+    dosshd/crypto/monocypher.c dosshd/crypto/monocypher-ed25519.c
+"$CBIN"
+
 [ "$1" = "unit" ] && { echo "== unit tests passed =="; exit 0; }
 
 echo "== e2e (QEMU, sequential) =="
