@@ -24,4 +24,11 @@ for t in e2e-m5a e2e-m5b e2e-m5c e2e-m5d-reconnect e2e-m3; do
     echo "-- $t --"
     python3 "test/$t.py" || { echo "FAILED: $t"; exit 1; }
 done
+
+# Opt-in NDIS2/DIS_PKT smoke test - builds a net floppy with net/mkbootdisk.sh
+# and drives DOSSHD over an emulated NIC. Skips unless DOSSH_DRIVERS is set (the
+# DOS networking stack is vendor-supplied; see docs/NETWORKING.md).
+echo "== net-smoke (opt-in via DOSSH_DRIVERS) =="
+bash test/net-smoke.sh || { echo "FAILED: net-smoke"; exit 1; }
+
 echo "== all tests passed =="
