@@ -2,10 +2,12 @@
  * net.c - DOSSH network transport: a small ARP/IP/TCP stack over a DOS
  *         packet driver, presented to the framing code as a byte stream.
  *
- * Scope is deliberately tiny: one static IP, one listening TCP port, one
- * active connection. Reliability for the interactive stream comes from TCP,
- * which also lets the packet receiver stay a single-buffer, drop-tolerant
- * stub (a lost inbound segment is simply retransmitted).
+ * Scope is deliberately tiny: one static IP, one listening TCP port, and up to
+ * NCONN simultaneous connections (see net.h) served from one array of slots.
+ * The screen mirror is broadcast to every client and their keystrokes are
+ * merged, so N terminals share one console. Reliability for the interactive
+ * stream comes from TCP, which also lets the packet receiver stay a
+ * single-buffer, drop-tolerant stub (a lost inbound segment is retransmitted).
  *
  * Replies reuse the source MAC of the frame that prompted them (the SLIRP /
  * gateway MAC), so the stack never needs to originate ARP.
@@ -241,43 +243,50 @@ static void arp_in( unsigned char *f, unsigned n )
 #define TS_SYNRCVD  1
 #define TS_ESTAB    2
 
-#define SND_SZ   8192
+#define SND_SZ   4096          /* per-connection; NCONN of these must fit DGROUP */
 #define SND_MASK (SND_SZ - 1)
 #define RCV_SZ   512
 #define RCV_MASK (RCV_SZ - 1)
 #define MSS_TX   1400
 #define REXMIT_TICKS 9          /* ~0.5s at 18.2 Hz */
 
-static unsigned char tstate;
-static unsigned char peer_mac[6], peer_ip[4];
-static unsigned      peer_port;
-static unsigned long snd_una, snd_nxt;
-static unsigned long rcv_nxt;
-static unsigned char sbuf[SND_SZ];
-static unsigned      s_una, s_nxt, s_end;
-static unsigned char rbuf[RCV_SZ];
-static unsigned      r_head, r_tail;
-static unsigned long rexmit_at;
-static unsigned      rexmit_count;     /* consecutive retransmits w/o progress */
-
 #define MAX_REXMIT 24          /* ~13s of no ACK -> peer is dead, re-LISTEN */
+
+/* One TCP connection. DOSSH broadcasts a single shared render stream to up to
+ * NCONN of these (net_tx_putc) and merges their keystrokes into the one BIOS
+ * ring; every byte of TCP state is per-connection so N clients coexist. */
+struct conn {
+    unsigned char tstate;
+    unsigned char peer_mac[6], peer_ip[4];
+    unsigned      peer_port;
+    unsigned long snd_una, snd_nxt;
+    unsigned long rcv_nxt;
+    unsigned char sbuf[SND_SZ];
+    unsigned      s_una, s_nxt, s_end;
+    unsigned char rbuf[RCV_SZ];
+    unsigned      r_head, r_tail;
+    unsigned long rexmit_at;
+    unsigned      rexmit_count;   /* consecutive retransmits w/o progress */
+    int           just_estab;     /* edge flag consumed once by net_take_new_slot */
+};
+static struct conn conns[NCONN];
 
 static unsigned long ticks( void )
 {
     return *(unsigned long __far *)MK_FP( 0x40, 0x6C );
 }
 
-static void tcp_reset_listen( void )
+static void tcp_reset_listen( struct conn *c )
 {
-    tstate = TS_LISTEN;
-    s_una = s_nxt = s_end = 0;
-    r_head = r_tail = 0;
-    rexmit_count = 0;
+    c->tstate = TS_LISTEN;
+    c->s_una = c->s_nxt = c->s_end = 0;
+    c->r_head = c->r_tail = 0;
+    c->rexmit_count = 0;
 }
 
 /* send one TCP segment: flags, seq/ack from state, optional MSS option,
  * optional payload of dlen bytes starting at buffer index doff. */
-static void tcp_send_seg( unsigned char flags, int with_mss,
+static void tcp_send_seg( struct conn *c, unsigned char flags, int with_mss,
                           unsigned doff, unsigned dlen )
 {
     static unsigned char seg[20 + 4 + MSS_TX];   /* static: runs in the ISR */
@@ -286,13 +295,13 @@ static void tcp_send_seg( unsigned char flags, int with_mss,
     unsigned long sum;
 
     wr16( seg + 0, my_port );
-    wr16( seg + 2, peer_port );
-    wr32( seg + 4, snd_nxt );
-    wr32( seg + 8, rcv_nxt );
+    wr16( seg + 2, c->peer_port );
+    wr32( seg + 4, c->snd_nxt );
+    wr32( seg + 8, c->rcv_nxt );
     seg[12] = (unsigned char)((hlen / 4) << 4);
     seg[13] = flags;
     /* advertise the real free space so the peer never overruns the ring */
-    wr16( seg + 14, (RCV_SZ - 1) - ((r_head - r_tail) & RCV_MASK) );
+    wr16( seg + 14, (RCV_SZ - 1) - ((c->r_head - c->r_tail) & RCV_MASK) );
     seg[16] = seg[17] = 0;          /* checksum (filled below) */
     seg[18] = seg[19] = 0;          /* urgent */
     if( with_mss ) {
@@ -300,37 +309,97 @@ static void tcp_send_seg( unsigned char flags, int with_mss,
         wr16( seg + 22, MSS_TX );
     }
     for( i = 0; i < dlen; i++ )
-        seg[hlen + i] = sbuf[(doff + i) & SND_MASK];
+        seg[hlen + i] = c->sbuf[(doff + i) & SND_MASK];
 
     /* checksum over pseudo-header + segment */
     sum = sum16( g_ip, 4, 0 );
-    sum = sum16( peer_ip, 4, sum );
+    sum = sum16( c->peer_ip, 4, sum );
     sum += IPP_TCP;
     sum += hlen + dlen;
     sum = sum16( seg, hlen + dlen, sum );
     wr16( seg + 16, fin16( sum ) );
 
-    ip_send( IPP_TCP, peer_mac, peer_ip, seg, hlen + dlen );
+    ip_send( IPP_TCP, c->peer_mac, c->peer_ip, seg, hlen + dlen );
     g_tcp_segs++;
 }
 
 /* transmit any buffered, not-yet-sent bytes as data segments */
-static void tcp_output( void )
+static void tcp_output( struct conn *c )
 {
     unsigned unsent;
 
-    if( tstate != TS_ESTAB )
+    if( c->tstate != TS_ESTAB )
         return;
-    unsent = (s_end - s_nxt) & SND_MASK;
+    unsent = (c->s_end - c->s_nxt) & SND_MASK;
     while( unsent ) {
         unsigned n = unsent > MSS_TX ? MSS_TX : unsent;
-        tcp_send_seg( 0x18, 0, s_nxt, n );    /* PSH|ACK */
-        if( snd_una == snd_nxt )              /* first unacked byte: arm timer */
-            rexmit_at = ticks() + REXMIT_TICKS;
-        s_nxt = (s_nxt + n) & SND_MASK;
-        snd_nxt += n;
+        tcp_send_seg( c, 0x18, 0, c->s_nxt, n );   /* PSH|ACK */
+        if( c->snd_una == c->snd_nxt )             /* first unacked byte: arm timer */
+            c->rexmit_at = ticks() + REXMIT_TICKS;
+        c->s_nxt = (c->s_nxt + n) & SND_MASK;
+        c->snd_nxt += n;
         unsent -= n;
     }
+}
+
+/* find the connection a segment belongs to by (source port, source IP) */
+static struct conn *find_conn( unsigned sport, unsigned char *srcip )
+{
+    int i;
+    for( i = 0; i < NCONN; i++ )
+        if( conns[i].tstate != TS_LISTEN
+            && conns[i].peer_port == sport
+            && memcmp( conns[i].peer_ip, srcip, 4 ) == 0 )
+            return &conns[i];
+    return 0;
+}
+
+/* pick a slot for a fresh SYN. First reclaim a slot this host already holds that
+ * has stalled (its peer stopped ACKing - an unclean drop now reconnecting): this
+ * keeps rapid reconnects from exhausting the free slots and leaving a pile of
+ * dead, still-retransmitting connections that flood the single RX buffer and
+ * starve new handshakes; it also preserves the M5.1 reconnect behaviour. Else a
+ * free (LISTEN) slot; else evict any same-host slot; otherwise refuse. */
+static struct conn *alloc_conn( unsigned char *srcip )
+{
+    int i;
+    for( i = 0; i < NCONN; i++ )
+        if( conns[i].tstate != TS_LISTEN
+            && conns[i].rexmit_count > 0
+            && memcmp( conns[i].peer_ip, srcip, 4 ) == 0 )
+            return &conns[i];
+    for( i = 0; i < NCONN; i++ )
+        if( conns[i].tstate == TS_LISTEN )
+            return &conns[i];
+    for( i = 0; i < NCONN; i++ )
+        if( memcmp( conns[i].peer_ip, srcip, 4 ) == 0 )
+            return &conns[i];
+    return 0;
+}
+
+/* reject a SYN we have no room for: RST|ACK so the client fails fast instead of
+ * retrying until timeout. Built stand-alone (no conn); seg is static (ISR). */
+static void send_rst( unsigned char *srcmac, unsigned char *srcip,
+                      unsigned sport, unsigned long seq )
+{
+    static unsigned char seg[20];
+    unsigned long sum;
+
+    wr16( seg + 0, my_port );
+    wr16( seg + 2, sport );
+    wr32( seg + 4, 0 );
+    wr32( seg + 8, seq + 1 );          /* ack the SYN we are refusing */
+    seg[12] = (20 / 4) << 4;
+    seg[13] = 0x14;                    /* RST|ACK */
+    seg[14] = seg[15] = 0;            /* window */
+    seg[16] = seg[17] = 0;            /* checksum */
+    seg[18] = seg[19] = 0;            /* urgent */
+    sum = sum16( g_ip, 4, 0 );
+    sum = sum16( srcip, 4, sum );
+    sum += IPP_TCP + 20;
+    sum = sum16( seg, 20, sum );
+    wr16( seg + 16, fin16( sum ) );
+    ip_send( IPP_TCP, srcmac, srcip, seg, 20 );
 }
 
 static void tcp_in( unsigned char *f, unsigned n )
@@ -345,7 +414,9 @@ static void tcp_in( unsigned char *f, unsigned n )
     unsigned dport = rd16( t + 2 );
     unsigned long seq = rd32( t + 4 );
     unsigned long ack = rd32( t + 8 );
+    unsigned char *srcip = ip + 12;
     unsigned dlen;
+    struct conn *c;
 
     if( dport != my_port )
         return;
@@ -353,100 +424,102 @@ static void tcp_in( unsigned char *f, unsigned n )
         return;
     dlen = tcplen - toff;
 
+    c = find_conn( sport, srcip );
+
     if( flags & 0x04 ) {                       /* RST */
-        tcp_reset_listen();
+        if( c )
+            tcp_reset_listen( c );
         return;
     }
 
-    /* A SYN from our peer's host while we are ESTABlished means the old client
-       is gone (an unclean drop leaves no FIN/RST) and it is reconnecting from a
-       new ephemeral port - drop the stale peer and set the new connection up
-       below. Gated on source IP so a stray/scanner SYN can't kill the session. */
-    if( (flags & 0x02) && tstate == TS_ESTAB
-                       && memcmp( ip + 12, peer_ip, 4 ) == 0 )
-        tcp_reset_listen();
-
-    if( tstate == TS_LISTEN ) {
-        if( !(flags & 0x02) )                  /* want SYN */
+    if( flags & 0x02 ) {                       /* SYN */
+        if( c )                                /* dup SYN on a live conn: the */
+            return;                            /* SYN|ACK retransmit covers it */
+        c = alloc_conn( srcip );
+        if( !c ) {                             /* all slots busy, different hosts */
+            send_rst( f + 6, srcip, sport, seq );
             return;
-        memcpy( peer_mac, f + 6, 6 );
-        memcpy( peer_ip, ip + 12, 4 );
-        peer_port = sport;
-        snd_una = snd_nxt = 0x00013700UL + ticks();
-        rcv_nxt = seq + 1;
-        tstate = TS_SYNRCVD;
-        s_una = s_nxt = s_end = 0;
-        r_head = r_tail = 0;
-        tcp_send_seg( 0x12, 1, 0, 0 );         /* SYN|ACK + MSS */
-        snd_nxt += 1;                          /* SYN consumes a seq */
-        rexmit_at = ticks() + REXMIT_TICKS;
+        }
+        memcpy( c->peer_mac, f + 6, 6 );
+        memcpy( c->peer_ip, srcip, 4 );
+        c->peer_port = sport;
+        c->snd_una = c->snd_nxt = 0x00013700UL + ticks() + (unsigned)( c - conns );
+        c->rcv_nxt = seq + 1;
+        c->tstate = TS_SYNRCVD;
+        c->s_una = c->s_nxt = c->s_end = 0;
+        c->r_head = c->r_tail = 0;
+        c->rexmit_count = 0;
+        tcp_send_seg( c, 0x12, 1, 0, 0 );      /* SYN|ACK + MSS */
+        c->snd_nxt += 1;                       /* SYN consumes a seq */
+        c->rexmit_at = ticks() + REXMIT_TICKS;
         return;
     }
 
-    /* must be our peer */
-    if( sport != peer_port || memcmp( ip + 12, peer_ip, 4 ) != 0 )
+    /* a non-SYN, non-RST segment must match an established/half-open conn */
+    if( !c )
         return;
 
-    if( tstate == TS_SYNRCVD ) {
-        if( (flags & 0x10) && ack == snd_nxt ) {   /* ACK of our SYN */
-            snd_una = ack;
-            tstate = TS_ESTAB;
-            rexmit_count = 0;                  /* fresh budget for the first data */
+    if( c->tstate == TS_SYNRCVD ) {
+        if( (flags & 0x10) && ack == c->snd_nxt ) {   /* ACK of our SYN */
+            c->snd_una = ack;
+            c->tstate = TS_ESTAB;
+            c->just_estab = 1;                 /* net_take_new_slot picks it up */
+            c->rexmit_count = 0;               /* fresh budget for the first data */
         } else
             return;
     }
 
-    if( tstate != TS_ESTAB )
+    if( c->tstate != TS_ESTAB )
         return;
 
     if( flags & 0x10 ) {                       /* ACK: advance send window */
-        if( (long)(ack - snd_una) > 0 && (long)(ack - snd_nxt) <= 0 ) {
-            unsigned freed = (unsigned)(ack - snd_una);
-            s_una = (s_una + freed) & SND_MASK;
-            snd_una = ack;
-            rexmit_at = ticks() + REXMIT_TICKS;
-            rexmit_count = 0;                  /* peer is alive and making progress */
+        if( (long)(ack - c->snd_una) > 0 && (long)(ack - c->snd_nxt) <= 0 ) {
+            unsigned freed = (unsigned)(ack - c->snd_una);
+            c->s_una = (c->s_una + freed) & SND_MASK;
+            c->snd_una = ack;
+            c->rexmit_at = ticks() + REXMIT_TICKS;
+            c->rexmit_count = 0;               /* peer is alive and making progress */
         }
     }
 
     if( dlen ) {
-        if( seq == rcv_nxt ) {                 /* in-order data: keys */
+        if( seq == c->rcv_nxt ) {              /* in-order data: keys */
             unsigned i, stored = 0;
             for( i = 0; i < dlen; i++ ) {
-                unsigned nh = (r_head + 1) & RCV_MASK;
-                if( nh == r_tail )             /* ring full: keep the rest */
+                unsigned nh = (c->r_head + 1) & RCV_MASK;
+                if( nh == c->r_tail )          /* ring full: keep the rest */
                     break;                     /* ... unacked, so it retransmits */
-                rbuf[r_head] = t[toff + i];
-                r_head = nh;
+                c->rbuf[c->r_head] = t[toff + i];
+                c->r_head = nh;
                 stored++;
             }
-            rcv_nxt += stored;                 /* only ack bytes we actually kept */
+            c->rcv_nxt += stored;              /* only ack bytes we actually kept */
         }
-        tcp_send_seg( 0x10, 0, 0, 0 );         /* ACK (also re-ACKs on gap) */
+        tcp_send_seg( c, 0x10, 0, 0, 0 );      /* ACK (also re-ACKs on gap) */
     }
 
     if( flags & 0x01 ) {                       /* FIN: ack and reopen */
-        rcv_nxt += 1;
-        tcp_send_seg( 0x10, 0, 0, 0 );
-        tcp_reset_listen();
+        c->rcv_nxt += 1;
+        tcp_send_seg( c, 0x10, 0, 0, 0 );
+        tcp_reset_listen( c );
     }
 }
 
-static void tcp_timer( void )
+static void tcp_timer( struct conn *c )
 {
-    if( tstate < TS_SYNRCVD )
+    if( c->tstate < TS_SYNRCVD )
         return;
-    if( (long)(snd_nxt - snd_una) > 0 && (long)(ticks() - rexmit_at) >= 0 ) {
-        if( ++rexmit_count > MAX_REXMIT ) {    /* peer stopped ACKing: give up */
-            tcp_reset_listen();                /* ... and free up for a reconnect */
+    if( (long)(c->snd_nxt - c->snd_una) > 0 && (long)(ticks() - c->rexmit_at) >= 0 ) {
+        if( ++c->rexmit_count > MAX_REXMIT ) { /* peer stopped ACKing: give up */
+            tcp_reset_listen( c );             /* ... and free up for a reconnect */
             return;
         }
         /* go-back-N: resend from the oldest unacked byte */
-        s_nxt = s_una;
-        snd_nxt = snd_una;
-        if( tstate == TS_SYNRCVD )
-            tcp_send_seg( 0x12, 1, 0, 0 );     /* resend SYN|ACK */
-        rexmit_at = ticks() + REXMIT_TICKS;
+        c->s_nxt = c->s_una;
+        c->snd_nxt = c->snd_una;
+        if( c->tstate == TS_SYNRCVD )
+            tcp_send_seg( c, 0x12, 1, 0, 0 );  /* resend SYN|ACK */
+        c->rexmit_at = ticks() + REXMIT_TICKS;
     }
 }
 
@@ -475,8 +548,10 @@ void net_poll( void )
 {
     static unsigned char work[1600];
     unsigned flen = 0;
+    int i;
 
-    tcp_timer();
+    for( i = 0; i < NCONN; i++ )
+        tcp_timer( &conns[i] );
 
     if( pkt_flag ) {
         _disable();
@@ -488,33 +563,100 @@ void net_poll( void )
         g_rx_frames++;
         handle_frame( work, flen );
     }
-    tcp_output();
+    for( i = 0; i < NCONN; i++ )
+        tcp_output( &conns[i] );
 }
 
 /* ---- link API for the framing code ----------------------------------- */
 
-int net_connected( void ) { return tstate == TS_ESTAB; }
-
-int net_tx_putc( int c )
+int net_connected( void )
 {
-    unsigned used = (s_end - s_una) & SND_MASK;
-    if( used >= SND_SZ - 1 )
-        return 0;
-    sbuf[s_end] = (unsigned char)c;
-    s_end = (s_end + 1) & SND_MASK;
+    int i;
+    for( i = 0; i < NCONN; i++ )
+        if( conns[i].tstate == TS_ESTAB )
+            return 1;
+    return 0;
+}
+
+int net_slots( void ) { return NCONN; }
+
+/* edge-triggered: return the index of a connection that has just reached ESTAB
+ * (and clear its flag), or -1. The caller sends it the telnet hello + repaint. */
+int net_take_new_slot( void )
+{
+    int i;
+    for( i = 0; i < NCONN; i++ )
+        if( conns[i].just_estab ) {
+            conns[i].just_estab = 0;
+            return i;
+        }
+    return -1;
+}
+
+/* Broadcast one screen byte to every connected client, all-or-none: append only
+ * if EVERY ESTAB conn has room, else 0 so tx_pump's render_pushback paces the
+ * shared stream to the slowest client and all clients stay byte-identical.
+ *
+ * A full buffer whose peer is still ACKing (rexmit_count == 0) just means that
+ * client is momentarily slow: pace (return 0) and it catches up. A full buffer
+ * whose peer has stopped ACKing (rexmit_count > 0) is a dead client - drop it
+ * here rather than let it freeze the healthy ones until tcp_timer reaps it. */
+int net_tx_putc( int ch )
+{
+    int i;
+    for( i = 0; i < NCONN; i++ )
+        if( conns[i].tstate == TS_ESTAB ) {
+            unsigned used = (conns[i].s_end - conns[i].s_una) & SND_MASK;
+            if( used >= SND_SZ - 1 ) {
+                if( conns[i].rexmit_count > 0 )
+                    tcp_reset_listen( &conns[i] );   /* dead: drop, don't block */
+                else
+                    return 0;                        /* slow but alive: pace   */
+            }
+        }
+    for( i = 0; i < NCONN; i++ )
+        if( conns[i].tstate == TS_ESTAB ) {
+            conns[i].sbuf[conns[i].s_end] = (unsigned char)ch;
+            conns[i].s_end = (conns[i].s_end + 1) & SND_MASK;
+        }
     return 1;
 }
 
-void net_tx_flush( void ) { tcp_output(); }
-
-int net_rx_getc( void )
+/* Unicast one byte to a single slot (the telnet hello, sent per new client). */
+int net_tx_putc_slot( int i, int ch )
 {
-    int c;
-    if( r_tail == r_head )
+    struct conn *c;
+    unsigned used;
+    if( i < 0 || i >= NCONN )
+        return 0;
+    c = &conns[i];
+    used = (c->s_end - c->s_una) & SND_MASK;
+    if( used >= SND_SZ - 1 )
+        return 0;
+    c->sbuf[c->s_end] = (unsigned char)ch;
+    c->s_end = (c->s_end + 1) & SND_MASK;
+    return 1;
+}
+
+void net_tx_flush( void )
+{
+    int i;
+    for( i = 0; i < NCONN; i++ )
+        tcp_output( &conns[i] );
+}
+
+int net_rx_getc( int i )
+{
+    struct conn *c;
+    int ch;
+    if( i < 0 || i >= NCONN )
         return -1;
-    c = rbuf[r_tail];
-    r_tail = (r_tail + 1) & RCV_MASK;
-    return c;
+    c = &conns[i];
+    if( c->r_tail == c->r_head )
+        return -1;
+    ch = c->rbuf[c->r_tail];
+    c->r_tail = (c->r_tail + 1) & RCV_MASK;
+    return ch;
 }
 
 /* ---- lifecycle ------------------------------------------------------- */
@@ -522,10 +664,14 @@ int net_rx_getc( void )
 int net_open( unsigned char a, unsigned char b, unsigned char c,
               unsigned char d, unsigned port )
 {
+    int i;
     g_ip[0] = a; g_ip[1] = b; g_ip[2] = c; g_ip[3] = d;
     my_port = port;
     pkt_flag = 0;
-    tcp_reset_listen();
+    for( i = 0; i < NCONN; i++ ) {
+        tcp_reset_listen( &conns[i] );
+        conns[i].just_estab = 0;
+    }
     if( !pkt_find() )   return 0;
     if( !pkt_access() ) return 0;
     pkt_get_address();

@@ -55,17 +55,28 @@ def row0():
 
 
 def serving():
+    # Drain the whole opening frame before closing, the way a real telnet client
+    # does. A probe that reads a few bytes and closes leaves a full, non-draining
+    # slot behind; with the multi-client broadcast (all-or-none, paced to the
+    # slowest client) that stalls the shared stream for the next connection, so a
+    # partial-read probe would report "not serving" while the box is in fact up.
     try:
         s = socket.create_connection(("127.0.0.1", PORT), timeout=2)
     except OSError:
         return False
-    s.settimeout(3)
+    s.settimeout(1.0)
+    got = False
+    end = time.time() + 3
     try:
-        ok = bool(s.recv(64))
+        while time.time() < end:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            got = True
     except socket.timeout:
-        ok = False
+        pass
     s.close()
-    return ok
+    return got
 
 
 def main():

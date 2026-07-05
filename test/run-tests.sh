@@ -20,7 +20,7 @@ cc -o "$BIN" dosshd/ansikey.c test/test_ansikey.c
 [ "$1" = "unit" ] && { echo "== unit tests passed =="; exit 0; }
 
 echo "== e2e (QEMU, sequential) =="
-for t in e2e-m5a e2e-m5b e2e-m5c e2e-m5d-reconnect e2e-m3; do
+for t in e2e-m5a e2e-m5b e2e-m5c e2e-m5-multiclient e2e-m5d-reconnect e2e-m3; do
     echo "-- $t --"
     python3 "test/$t.py" || { echo "FAILED: $t"; exit 1; }
 done

@@ -1,14 +1,20 @@
 /*
  * net.h - DOSSH network transport: TCP over a DOS packet driver.
  *
- * A tiny, purpose-built ARP/IP/TCP stack (single listening socket, one
- * connection) over the Crynwr packet-driver interface, presented to the
- * framing code as the same byte-stream `link` the serial path uses.
+ * A tiny, purpose-built ARP/IP/TCP stack (single listening socket, up to NCONN
+ * simultaneous connections) over the Crynwr packet-driver interface, presented
+ * to the framing code as the same byte-stream `link` the serial path uses. The
+ * screen mirror is broadcast to every client; their keystrokes are merged.
  *
  * MIT License. Copyright (c) 2026 Sergey Subbotin.
  */
 #ifndef DOSSH_NET_H
 #define DOSSH_NET_H
+
+/* Maximum simultaneous TCP clients. DOSSH mirrors one shared screen stream to
+ * all of them and merges their keystrokes. Bounded by DGROUP: each slot carries
+ * a SND_SZ send ring. telnet.c keeps a parallel per-slot IAC state array. */
+#define NCONN 3
 
 /* our identity, filled by net_open() */
 extern unsigned char g_mac[6];
@@ -37,11 +43,14 @@ unsigned char net_pkt_int( void );
 unsigned      net_pkt_handle( void );
 void          net_release( unsigned char int_no, unsigned handle );
 
-/* byte-stream link API over the single TCP connection (used by the framing
- * code exactly as the serial UART is) */
-int  net_connected( void );        /* 1 once a client TCP session is ESTABLISHED */
-int  net_tx_putc( int c );         /* queue a byte; 0 if the send buffer is full */
-void net_tx_flush( void );         /* push queued bytes out as TCP segments */
-int  net_rx_getc( void );          /* next received byte, or -1 if none */
+/* byte-stream link API over up to NCONN TCP connections. The screen mirror is
+ * broadcast to every client; keystrokes from all clients are merged. */
+int  net_connected( void );        /* 1 if any client TCP session is ESTABLISHED */
+int  net_slots( void );            /* number of connection slots (NCONN)          */
+int  net_take_new_slot( void );    /* index of a just-connected slot, else -1     */
+int  net_tx_putc( int c );         /* broadcast a byte to all clients; 0 if any is full */
+int  net_tx_putc_slot( int i, int c ); /* unicast a byte to one slot; 0 if full   */
+void net_tx_flush( void );         /* push queued bytes out as TCP segments        */
+int  net_rx_getc( int i );         /* next byte received from slot i, or -1        */
 
 #endif

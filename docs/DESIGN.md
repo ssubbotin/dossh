@@ -372,3 +372,36 @@ flaky VPN link; `net.c`):
   enters the diff loop that would index past the 4000-byte shadow.
 - **`udp_echo` removed.** The M4 bring-up UDP reflector is gone (it was an
   unauthenticated reflection surface, unused by the console).
+
+## 15. Multi-client (broadcast model)
+
+The stack now serves **up to `NCONN` (= 3) connections at once** instead of one.
+All per-connection TCP state (`peer`, sequence numbers, the send/receive rings,
+the retransmit timer) moved into a `struct conn`, and `net.c` keeps a fixed
+`conns[NCONN]` array. `SND_SZ` dropped 8192 → 4096 so three send rings still fit
+DGROUP (verified via the link map: DGROUP ≈ 36 KB, well under 64 KB).
+
+- **Demux, not a single peer.** `tcp_in` routes each segment to its slot by
+  `(source port, source IP)`. A `SYN` with no match opens a new slot; the M5.1
+  "`SYN` in `ESTAB` re-`LISTEN`s" special-case is gone, replaced by slot
+  allocation: reclaim a *stalled* slot the same host already holds (an unclean
+  reconnect), else a free slot, else evict a same-host slot, else `RST`.
+- **One shared screen, broadcast.** `render.c` is unchanged — a single shadow
+  buffer and one diff stream. `net_tx_putc` appends each rendered byte to *every*
+  established client's ring, **all-or-none**: if any client's ring is full it
+  returns 0 and the render pump (`render_pushback`) pauses, so the shared stream
+  paces to the slowest client and all clients stay byte-identical. A brand-new
+  client (`net_take_new_slot`) gets a unicast telnet hello and a forced full
+  repaint (`render_reset`), so it receives the whole screen on join.
+- **Merged keyboard.** Every client's decoded keystrokes are injected into the
+  one BIOS type-ahead ring; telnet IAC state is per-slot (`telnet.c` arrays).
+- **A dead client can't freeze the rest.** All-or-none pacing waits on a *slow*
+  client, but a *dead* one (ring full while its peer has stopped ACKing —
+  `rexmit_count > 0`) is dropped from the broadcast on the spot rather than
+  stalling the shared stream until the retransmit cap fires.
+
+Proven by `test/e2e-m5-multiclient.py` (two telnet clients decode the same
+prompt; one types `echo BANANA` and the output appears on both). Note for tests:
+a liveness probe must **drain** the opening frame like a real client — a probe
+that reads a few bytes and closes leaves a full, non-draining slot that (under
+all-or-none pacing) briefly stalls the next connection.

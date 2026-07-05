@@ -183,25 +183,27 @@ static void do_reboot( void )
 
 static void net_tick( void )
 {
-    static int was_conn;
-    int b, conn;
+    int i, b;
 
     net_poll();                               /* rx + tcp + retransmit */
 
-    conn = net_connected();
-    if( conn && !was_conn ) {                 /* new client */
-        telnet_reset();
-        telnet_hello();                       /* negotiate char mode */
+    /* each newly ESTABLISHED client: unicast the telnet hello, force a full
+       repaint so it gets the whole screen (broadcast to all - one repaint per
+       join is the cost of the shared stream) */
+    while( (i = net_take_new_slot()) >= 0 ) {
+        telnet_reset( i );
+        telnet_hello( i );                    /* negotiate char mode */
         render_reset();                       /* then full repaint   */
     }
-    was_conn = conn;
 
-    while( (b = net_rx_getc()) >= 0 )         /* strip IAC, map keystrokes */
-        telnet_in( (unsigned char)b );
+    /* merge keystrokes from every client into the one BIOS ring */
+    for( i = 0; i < net_slots(); i++ )
+        while( (b = net_rx_getc( i )) >= 0 )
+            telnet_in( i, (unsigned char)b );
 
-    if( conn ) {
-        tx_pump();                            /* queue screen bytes  */
-        net_tx_flush();                       /* push them as segments */
+    if( net_connected() ) {
+        tx_pump();                            /* broadcast screen bytes */
+        net_tx_flush();                       /* push them as segments  */
     }
 }
 

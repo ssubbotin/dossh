@@ -84,6 +84,12 @@ last line of output), so the `printf`/`tput` step matters. If `tput lines` still
 shows 24, your terminal ignored the resize escape — set 80×25 via the window or
 the terminal profile instead.
 
+**Several clients at once** — up to three terminals can connect at the same time.
+They share one console: everyone sees the same screen, and keystrokes from any
+client are merged into the one keyboard, so you can watch together or hand off
+between machines. A client that drops uncleanly is reaped on its own so it can't
+freeze the others.
+
 **Disconnect** from the client — `exit`/`Ctrl-D` are forwarded to DOS, not to the
 link, so close from the client: `telnet` → `Ctrl-]` then `quit`; `nc` →
 `Ctrl-C`; PuTTY → close the window.
@@ -120,6 +126,9 @@ or stunnel). See **[docs/SECURITY.md](docs/SECURITY.md)**.
       `e2e-m5c.py`, and the `test/test_ansikey.c` key-map unit test.
 - [x] **MIT-clean TCP/IP layer** — a small purpose-built ARP/IP/TCP stack
       (`dosshd/net.c`), no third-party stack, so the release stays MIT.
+- [x] **Multiple simultaneous clients** — the TCP stack serves several
+      connections at once (broadcast screen, merged keyboard);
+      `test/e2e-m5-multiclient.py` drives two clients sharing one console.
 - [ ] Authentication; optional transport encryption.
 
 ## Building & testing
