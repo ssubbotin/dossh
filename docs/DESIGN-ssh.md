@@ -1,12 +1,17 @@
 # DESIGN — SSH server mode for DOSSH (research + options)
 
-**Status: P1 BUILT and proven (experimental).** Native in-DOS SSH — architecture
-B below — now works end to end: a stock `ssh` client authenticates and drives a
-real-mode DOS box over an encrypted session that terminates *on the box*
-(`curve25519-sha256` + `ssh-ed25519` + `chacha20-poly1305@openssh.com`, computed
-from the timer ISR), shipped in the separate `DOSSHDS.EXE` build and proven by
-`test/e2e-ssh-dos.py`. It is single-client and carries the DOS-entropy caveat of
-§6, so it ships EXPERIMENTAL; P2 (publickey) and P3 (multi-client) remain. The
+**Status: P1–P3 BUILT and proven (experimental).** Native in-DOS SSH —
+architecture B below — now works end to end: a stock `ssh` client authenticates
+(password *or* publickey, P2) and drives a real-mode DOS box over an encrypted
+session that terminates *on the box* (`curve25519-sha256` + `ssh-ed25519` +
+`chacha20-poly1305@openssh.com`, computed from the timer ISR), shipped in the
+separate `DOSSHDS.EXE` build and proven by `test/e2e-ssh-dos.py`. **P3 is done:
+the SSH path is now multi-client** — up to `NCONN` clients each run their own
+transport + userauth + session channel, the shared screen is rendered once and
+framed+encrypted per client with that client's keys, and their keystrokes merge
+into one console, exactly like the telnet path (`test/e2e-ssh-multiclient.py`
+drives TWO real `ssh` clients at once). It still carries the DOS-entropy caveat
+of §6, so it ships EXPERIMENTAL. The
 rest of this document is the original research/design that led there. This document
 exists so the maintainer can decide *whether* and *how* to give DOSSH a real SSH
 server, so a DOS box can be reached with a stock `ssh` client instead of

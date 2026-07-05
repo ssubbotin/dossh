@@ -13,8 +13,18 @@
 
 /* Maximum simultaneous TCP clients. DOSSH mirrors one shared screen stream to
  * all of them and merges their keystrokes. Bounded by DGROUP: each slot carries
- * a SND_SZ send ring. telnet.c keeps a parallel per-slot IAC state array. */
+ * a SND_SZ send ring. telnet.c keeps a parallel per-slot IAC state array.
+ *
+ * The SSH build (DOSSH_SSH) additionally carries a per-slot ssh_conn (transport
+ * state + session keys + streaming exchange hash + channel state) AND the -mm
+ * -3 crypto in the same near-data DGROUP, so it runs 2 SSH clients rather than
+ * 3 telnet clients. This only shrinks the SSH objects (net-ssh.o etc.); the
+ * default 8086 DOSSHD.EXE keeps NCONN 3 and stays byte-for-byte identical. */
+#ifdef DOSSH_SSH
+#define NCONN 2
+#else
 #define NCONN 3
+#endif
 
 /* our identity, filled by net_open() */
 extern unsigned char g_mac[6];
@@ -58,6 +68,7 @@ void net_slot_drop( int i );       /* reject a slot: abort the session, re-LISTE
 #ifdef DOSSH_SSH
 int  net_slot_connected( int i );  /* 1 if slot i's TCP session is ESTABLISHED     */
 int  net_tx_room_slot( int i );    /* free bytes in slot i's TCP send ring          */
+int  net_slot_stalled( int i );    /* 1 if slot i's ring is full AND its peer stopped ACKing (dead) */
 #endif
 
 #endif

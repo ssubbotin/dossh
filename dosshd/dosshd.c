@@ -57,14 +57,20 @@ static unsigned      net_port  = 23;      /* the telnet port, so `telnet <host>`
 
 #ifdef DOSSH_SSH
 /* ---- SSH server state (resident, DGROUP) ---------------------------------
- * P1: a single SSH session bound to one net.c slot (multi-client SSH is P3).
+ * P3: multi-client. One ssh_conn per net.c slot (1:1), so up to NCONN clients
+ * each run their own transport + userauth + session channel; the render is
+ * produced once and framed+encrypted per slot with that slot's keys (see
+ * docs/DESIGN-ssh.md sec 4). ssh.c keeps only the per-slot PERSISTENT state
+ * here; the packet-assembly / hash / keystroke scratch it needs is a single
+ * SHARED copy inside ssh.c, reused per slot within this single-threaded tick.
  * The transport/framing is ssh.c where telnet.c sits on the net path; the same
  * TCP stack (net.c) carries it. */
 static int          g_ssh_mode;             /* 1 = SSH transport                 */
 static int          g_ssh_serial;           /* 1 = SSH over COM1, else over net   */
 static int          g_ssh_ser_started;      /* serial: a session is in progress   */
-static ssh_conn     g_ssh;                  /* the one SSH connection            */
-static int          g_ssh_slot = -1;        /* net slot bound to it, -1 = idle   */
+static ssh_conn     ssh_slots[NCONN];       /* per-slot SSH state (1:1 net conns) */
+static int          ssh_active[NCONN];      /* 1 = slot i has a live SSH session  */
+static int          ssh_ready_seen[NCONN];  /* 1 once slot i's shell channel is up */
 static unsigned char g_hostkey_sk[64];      /* resident ed25519 host key         */
 static unsigned char g_hostkey_pk[32];
 static char         g_ssh_pw[64];           /* configured password (empty = open) */
@@ -73,13 +79,20 @@ static int          g_ssh_have_pw;
 static unsigned char g_authkeys[SSH_MAX_AUTHKEYS][32]; /* authorized ed25519 keys */
 static unsigned      g_authkey_count;       /* loaded from AUTHKEYS at install    */
 static int          g_ssh_cols = 80, g_ssh_rows = 25;   /* last client window     */
+static unsigned char g_txplain[SSH_CHAN_CHUNK]; /* one render chunk, framed per slot */
 static unsigned     g_ssh_stir;             /* rolling ISR entropy sample        */
 static int          g_ssh_stack_op;         /* dispatcher: 0 = tick, 1 = install  */
+
+/* keep this much of each slot's TCP send ring free for that slot's control
+ * (window-adjust / channel close) so the SHARED ssh output buffer always drains
+ * fully before the next slot is serviced; the broadcast never fills past it. */
+#define SSH_RING_RESERVE 512
 
 extern void ssh_run_on_stack( void );       /* sshtramp.asm: private-stack shim  */
 void        ssh_stack_dispatch( void );     /* the shim calls this (extern)      */
 static void ssh_worker( void );
 static void ssh_net_worker( void );
+static void ssh_net_broadcast( void );
 static void ssh_serial_worker( void );
 static void ssh_install_setup( void );
 #endif
@@ -250,8 +263,11 @@ static void net_tick( void )
  * framing, and the render/ansikey layers above it are untouched (they see
  * decrypted bytes, just as telnet sees post-IAC bytes). */
 
-/* drain ssh_output() to the bound slot's TCP send ring, bounded by ring room so
- * no encrypted byte is ever dropped - leftover stays queued inside ssh's ob. */
+/* drain the SHARED ssh output buffer (ssh_output) to net slot `slot`'s TCP send
+ * ring, bounded by ring room. Because the broadcast keeps SSH_RING_RESERVE bytes
+ * free in every slot's ring and one slot's control output is small, this always
+ * fully drains before the next slot is serviced - so the shared buffer never
+ * carries one slot's bytes into another (see docs/DESIGN-ssh.md sec 4). */
 static void ssh_pump_output( int slot )
 {
     unsigned char buf[128];
@@ -261,15 +277,15 @@ static void ssh_pump_output( int slot )
         room = (unsigned)net_tx_room_slot( slot );
         if( room == 0 ) break;
         if( room > sizeof( buf ) ) room = sizeof( buf );
-        n = ssh_output( &g_ssh, buf, room );
+        n = ssh_output( &ssh_slots[slot], buf, room );
         if( n == 0 ) break;
         for( k = 0; k < n; k++ )
             net_tx_putc_slot( slot, buf[k] );  /* fits: bounded by room above */
     }
 }
 
-/* pull render bytes and stage them as SSH channel data (mirrors tx_pump); the
- * channel's return-0-when-full paces the shared stream exactly like the net path */
+/* pull render bytes and stage them as SSH channel data for the single serial
+ * client (mirrors tx_pump); the channel's return-0-when-full paces the stream */
 static void ssh_tx_pump( void )
 {
     unsigned budget = TX_BUDGET;
@@ -278,7 +294,7 @@ static void ssh_tx_pump( void )
         int b = render_next_byte( 0 );         /* network cadence (serial=0) */
         if( b < 0 )
             break;
-        if( !ssh_channel_putc( &g_ssh, b ) ) { /* staging buffer full */
+        if( !ssh_channel_putc( &ssh_slots[0], b ) ) { /* staging buffer full */
             render_pushback( b );              /* ... resume next tick */
             break;
         }
@@ -295,75 +311,150 @@ static void ssh_worker( void )
         ssh_net_worker();
 }
 
+/* ---- multi-client screen broadcast ---------------------------------------
+ * The render diff stream is a single shared shadow (like telnet). Consume it
+ * ONCE per round into g_txplain, then frame+encrypt that plaintext for EACH
+ * ready slot with that slot's own keys and push it onto that slot's ring - so
+ * the wire bytes differ per client but the plaintext is rendered once. Paced to
+ * the slowest ALIVE slot (a stalled/dead slot is evicted, matching net_tx_putc).
+ */
+static void ssh_net_broadcast( void )
+{
+    unsigned budget = TX_BUDGET;
+    int i, b;
+
+    for( ;; ) {
+        unsigned cap = SSH_CHAN_CHUNK;
+        int any = 0, n = 0, k;
+
+        /* the chunk is bounded by the tightest ready slot: its SSH flow-control
+           window/maxpkt AND its TCP ring room (less the reserve + frame slack) */
+        for( i = 0; i < net_slots(); i++ ) {
+            unsigned a, room, netcap;
+            if( !ssh_active[i] || !net_slot_connected( i ) )      continue;
+            if( !ssh_channel_ready( &ssh_slots[i] ) )            continue;
+            any = 1;
+            a = ssh_channel_avail( &ssh_slots[i] );
+            room = (unsigned)net_tx_room_slot( i );
+            netcap = ( room > SSH_RING_RESERVE + 40 )
+                     ? room - SSH_RING_RESERVE - 40 : 0;
+            if( netcap < a ) a = netcap;
+            if( a == 0 && net_slot_stalled( i ) ) {  /* dead: evict, don't pace */
+                net_slot_drop( i );
+                ssh_active[i] = 0;
+                continue;
+            }
+            if( a < cap ) cap = a;
+        }
+        if( !any )            break;
+        if( cap == 0 )        break;             /* paced to the slowest slot */
+        if( cap > budget )    cap = budget;
+        if( cap == 0 )        break;
+
+        /* consume the shared render stream once for this round */
+        while( (unsigned)n < cap ) {
+            b = render_next_byte( 0 );
+            if( b < 0 ) break;
+            g_txplain[n++] = (unsigned char)b;
+        }
+        if( n == 0 ) break;                      /* nothing to render now */
+
+        /* frame+encrypt the identical plaintext per ready slot, its own keys */
+        for( i = 0; i < net_slots(); i++ ) {
+            unsigned char wire[SSH_CHAN_CHUNK + 40];
+            unsigned wlen;
+            if( !ssh_active[i] || !net_slot_connected( i ) )     continue;
+            if( !ssh_channel_ready( &ssh_slots[i] ) )           continue;
+            wlen = ssh_channel_emit( &ssh_slots[i], g_txplain, (unsigned)n,
+                                     wire, sizeof( wire ) );
+            for( k = 0; (unsigned)k < wlen; k++ )
+                net_tx_putc_slot( i, wire[k] );  /* pre-checked ring room */
+        }
+        budget -= (unsigned)n;
+        if( budget == 0 ) break;
+    }
+}
+
 static void ssh_net_worker( void )
 {
     int i, b;
 
     net_poll();                                /* rx + tcp + retransmit */
 
-    /* new TCP connections: bind the first to the single P1 SSH session and hand
-       it our version string + KEXINIT; reject the rest (multi-client SSH is P3). */
+    /* new TCP connections: start a fresh SSH session on the same-index slot and
+       hand it our version string + KEXINIT. Up to NCONN clients coexist. */
     while( ( i = net_take_new_slot() ) >= 0 ) {
-        if( g_ssh_slot < 0 || i == g_ssh_slot ) {
-            g_ssh_slot = i;
-            ssh_reset( &g_ssh, g_hostkey_sk, g_hostkey_pk );
-            if( g_ssh_have_pw )
-                ssh_set_password( &g_ssh, g_ssh_pw );
-            if( g_authkey_count )
-                ssh_set_authorized_keys( &g_ssh,
-                                         (const unsigned char *)g_authkeys,
-                                         g_authkey_count );
-            g_ssh_cols = 80; g_ssh_rows = 25;
-            render_reset();                    /* first channel data repaints */
-            ssh_pump_output( g_ssh_slot );     /* SSH-2.0-... + KEXINIT        */
-        } else {
+        ssh_reset( &ssh_slots[i], g_hostkey_sk, g_hostkey_pk );
+        if( g_ssh_have_pw )
+            ssh_set_password( &ssh_slots[i], g_ssh_pw );
+        if( g_authkey_count )
+            ssh_set_authorized_keys( &ssh_slots[i],
+                                     (const unsigned char *)g_authkeys,
+                                     g_authkey_count );
+        ssh_active[i] = 1;
+        ssh_ready_seen[i] = 0;
+        g_ssh_cols = 80; g_ssh_rows = 25;
+        ssh_pump_output( i );                  /* SSH-2.0-... + KEXINIT         */
+    }
+
+    /* per slot: feed inbound wire bytes, drain replies, merge its keystrokes */
+    for( i = 0; i < net_slots(); i++ ) {
+        if( !ssh_active[i] )
+            continue;
+        if( !net_slot_connected( i ) ) {       /* peer went away: free the slot */
+            ssh_active[i] = 0;
+            continue;
+        }
+
+        {
+            unsigned char rb[512];
+            unsigned rn = 0;
+            while( rn < sizeof( rb ) && ( b = net_rx_getc( i ) ) >= 0 ) {
+                rng_stir( (unsigned)b ^ g_ssh_stir++ );   /* fold arrival jitter */
+                rb[rn++] = (unsigned char)b;
+            }
+            if( rn )
+                ssh_input( &ssh_slots[i], rb, rn );
+        }
+        ssh_pump_output( i );                  /* handshake / protocol replies  */
+
+        /* merged keyboard: drain this slot's decrypted keystrokes (the shared
+           ring holds only this slot's bytes right now) into the one BIOS ring. */
+        while( ( b = ssh_channel_getc( &ssh_slots[i] ) ) >= 0 )
+            ansi_key_byte( (unsigned char)b );
+
+        if( ssh_channel_ready( &ssh_slots[i] ) ) {
+            int cols, rows;
+            /* This slot's shell just came up: force a full repaint so THIS
+               client gets the whole screen off the shared shadow - even if
+               another already-ready client has consumed the diff stream up to
+               date (the repaint reaches every ready slot, like telnet's join). */
+            if( !ssh_ready_seen[i] ) {
+                ssh_ready_seen[i] = 1;
+                render_reset();
+            }
+            ssh_winsize( &ssh_slots[i], &cols, &rows );   /* SSH's NAWS equiv. */
+            if( cols != g_ssh_cols || rows != g_ssh_rows ) {
+                g_ssh_cols = cols; g_ssh_rows = rows;
+                render_reset();                /* a client resized: full repaint */
+            }
+        }
+
+        /* teardown: peer closed the channel / sent DISCONNECT, or a fatal error */
+        if( ssh_channel_closed( &ssh_slots[i] ) || ssh_failed( &ssh_slots[i] )
+            || ssh_slots[i].state == SSH_ST_CLOSED ) {
+            ssh_pump_output( i );              /* push any final bytes first    */
+            ssh_discard_output();              /* ... drop any that did not fit */
             net_slot_drop( i );
+            ssh_active[i] = 0;
         }
     }
 
-    if( g_ssh_slot < 0 )
-        return;
-    if( !net_slot_connected( g_ssh_slot ) ) {  /* peer went away: free the session */
-        g_ssh_slot = -1;
-        return;
-    }
+    /* broadcast the shared screen: render once, frame+encrypt per ready slot */
+    ssh_net_broadcast();
+    net_tx_flush();                            /* push queued segments out      */
 
-    /* inbound SSH wire bytes -> the state machine (which queues any replies) */
-    {
-        unsigned char rb[512];
-        unsigned rn = 0;
-        while( rn < sizeof( rb ) && ( b = net_rx_getc( g_ssh_slot ) ) >= 0 ) {
-            rng_stir( (unsigned)b ^ g_ssh_stir++ );   /* fold arrival jitter */
-            rb[rn++] = (unsigned char)b;
-        }
-        if( rn )
-            ssh_input( &g_ssh, rb, rn );
-    }
-    ssh_pump_output( g_ssh_slot );             /* handshake / protocol replies */
-
-    if( ssh_channel_ready( &g_ssh ) ) {        /* shell granted: byte pipe is up */
-        int cols, rows;
-        ssh_winsize( &g_ssh, &cols, &rows );   /* SSH's NAWS equivalent */
-        if( cols != g_ssh_cols || rows != g_ssh_rows ) {
-            g_ssh_cols = cols; g_ssh_rows = rows;
-            render_reset();                    /* client resized: full repaint */
-        }
-        while( ( b = ssh_channel_getc( &g_ssh ) ) >= 0 )
-            ansi_key_byte( (unsigned char)b );  /* keystrokes -> BIOS ring (+ reboot sentinel) */
-        ssh_tx_pump();                          /* screen -> channel staging */
-        ssh_channel_flush( &g_ssh );            /* frame + encrypt as CHANNEL_DATA */
-        ssh_pump_output( g_ssh_slot );
-    }
-
-    /* teardown: peer closed the channel / sent DISCONNECT, or a fatal error */
-    if( ssh_channel_closed( &g_ssh ) || ssh_failed( &g_ssh )
-        || g_ssh.state == SSH_ST_CLOSED ) {
-        ssh_pump_output( g_ssh_slot );          /* push any final bytes first */
-        net_slot_drop( g_ssh_slot );
-        g_ssh_slot = -1;
-    }
-
-    rng_stir( g_ssh_stir++ );                   /* continuous stir in the ISR */
+    rng_stir( g_ssh_stir++ );                  /* continuous stir in the ISR    */
 }
 
 /* ---- SSH over COM1 --------------------------------------------------------
@@ -382,7 +473,7 @@ static void ssh_serial_pump_output( void )
 
     while( budget ) {
         unsigned take = budget < sizeof( buf ) ? budget : sizeof( buf );
-        n = ssh_output( &g_ssh, buf, take );
+        n = ssh_output( &ssh_slots[0], buf, take );
         if( n == 0 )
             break;
         for( k = 0; k < n; k++ ) {
@@ -408,21 +499,22 @@ static void ssh_serial_worker( void )
     }
 
     if( rn ) {
-        /* start (or restart, after a prior session ended/errored) on first bytes */
-        if( !g_ssh_ser_started || g_ssh.state == SSH_ST_ERROR
-            || g_ssh.state == SSH_ST_CLOSED ) {
-            ssh_reset( &g_ssh, g_hostkey_sk, g_hostkey_pk );
+        /* start (or restart, after a prior session ended/errored) on first bytes.
+           Serial is point-to-point: a single client on ssh_slots[0]. */
+        if( !g_ssh_ser_started || ssh_slots[0].state == SSH_ST_ERROR
+            || ssh_slots[0].state == SSH_ST_CLOSED ) {
+            ssh_reset( &ssh_slots[0], g_hostkey_sk, g_hostkey_pk );
             if( g_ssh_have_pw )
-                ssh_set_password( &g_ssh, g_ssh_pw );
+                ssh_set_password( &ssh_slots[0], g_ssh_pw );
             if( g_authkey_count )
-                ssh_set_authorized_keys( &g_ssh,
+                ssh_set_authorized_keys( &ssh_slots[0],
                                          (const unsigned char *)g_authkeys,
                                          g_authkey_count );
             g_ssh_cols = 80; g_ssh_rows = 25;
             g_ssh_ser_started = 1;
             render_reset();
         }
-        ssh_input( &g_ssh, rb, rn );
+        ssh_input( &ssh_slots[0], rb, rn );
     }
 
     if( !g_ssh_ser_started )
@@ -430,17 +522,17 @@ static void ssh_serial_worker( void )
 
     ssh_serial_pump_output();                  /* handshake / protocol replies */
 
-    if( ssh_channel_ready( &g_ssh ) ) {
+    if( ssh_channel_ready( &ssh_slots[0] ) ) {
         int cols, rows;
-        ssh_winsize( &g_ssh, &cols, &rows );
+        ssh_winsize( &ssh_slots[0], &cols, &rows );
         if( cols != g_ssh_cols || rows != g_ssh_rows ) {
             g_ssh_cols = cols; g_ssh_rows = rows;
             render_reset();
         }
-        while( ( b = ssh_channel_getc( &g_ssh ) ) >= 0 )
+        while( ( b = ssh_channel_getc( &ssh_slots[0] ) ) >= 0 )
             ansi_key_byte( (unsigned char)b );
         ssh_tx_pump();
-        ssh_channel_flush( &g_ssh );
+        ssh_channel_flush( &ssh_slots[0] );
         ssh_serial_pump_output();
     }
 

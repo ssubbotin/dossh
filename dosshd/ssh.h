@@ -42,13 +42,18 @@
 
 #include <stdint.h>
 #include "crypto.h"        /* DOSSH_FAR */
+#include "sha256.h"        /* sha256_ctx: streaming exchange-hash transcript */
 
-/* Buffer sizes (all live in the ssh_conn struct, i.e. DGROUP on DOS). A single
- * binary packet must fit ib/ob; the client KEXINIT is the largest (~1.1 KB). */
-#define SSH_IB_SZ   2048   /* inbound packet-accumulation buffer            */
-#define SSH_OB_SZ   2048   /* outbound drain buffer                          */
-#define SSH_IC_SZ   2048   /* stored client KEXINIT payload  (I_C)          */
-#define SSH_IS_SZ    512   /* stored server KEXINIT payload  (I_S)          */
+/* Buffer sizes. ib is PER-SLOT (it accumulates one client's inbound packets
+ * across ticks); a single binary packet must fit it, and the client KEXINIT is
+ * the largest (~1.1-1.5 KB). ob is a SHARED transient (see ssh.c): the tick is
+ * single-threaded, so one outbound drain buffer is framed for the slot being
+ * serviced and fully drained before the next. The exchange hash is computed
+ * with a streaming SHA-256 over the transcript (a per-slot sha256_ctx), so the
+ * old per-slot I_C copy is gone - the KEXINIT is hashed straight out of ib. */
+#define SSH_IB_SZ   2048   /* inbound packet-accumulation buffer (per slot)  */
+#define SSH_OB_SZ   2048   /* outbound drain buffer (shared transient)       */
+#define SSH_IS_SZ    512   /* stored server KEXINIT payload  (I_S, per slot) */
 
 /* Channel-data plumbing. CIN is the decrypted-keystroke ring the client types
  * into (small: keystrokes, drained every tick); COUT stages screen bytes to be
@@ -77,39 +82,42 @@ enum {
 	SSH_ST_ERROR                 /* protocol/crypto failure (see err_msg)     */
 };
 
+/*
+ * ssh_conn is now the PER-SLOT persistent state only (multi-client: one per
+ * connection, ssh_slots[NCONN]). Everything that is pure transient scratch -
+ * the outbound drain buffer, the exchange-hash preimage, the ECDH working
+ * values, the decrypted-keystroke ring, the screen staging buffer - lives in a
+ * single SHARED copy in ssh.c, reused non-reentrantly for whichever slot the
+ * cooperative tick is servicing (see docs/DESIGN-ssh.md sec 4). Likewise the
+ * host key, the password and the authorized-key set are the SAME for every
+ * client, so they are process-global in ssh.c rather than replicated per slot.
+ * What remains here is only what must survive across ticks for THIS client:
+ * the transport state, its two session keys + sequence numbers, the session id,
+ * the streaming exchange-hash transcript, the channel state, and the auth state.
+ */
 typedef struct ssh_conn {
 	int          state;
 	int          err;            /* nonzero once a fatal error is latched      */
 	const char  *err_msg;        /* human-readable reason (native only)        */
 	int          done;           /* 1 once SERVICE_REQUEST has been decrypted  */
 
-	/* ed25519 host key (expanded secret seed||pub, and the public key) */
-	uint8_t      hostkey_sk[64];
-	uint8_t      hostkey_pk[32];
-
-	/* peer identification string, CR/LF stripped (V_C) */
+	/* peer identification string, CR/LF stripped (V_C) - kept for the exchange
+	 * hash (hashed at KEXINIT) and for logging. */
 	char         cli_ver[256];
 	unsigned     cli_ver_len;
 
-	/* inbound accumulation + outbound drain */
+	/* inbound accumulation (per slot: a partial packet spans ticks) */
 	uint8_t      ib[SSH_IB_SZ]; unsigned ib_len;
-	uint8_t      ob[SSH_OB_SZ]; unsigned ob_len;
 
-	/* verbatim KEXINIT payloads for the exchange hash */
-	uint8_t      i_c[SSH_IC_SZ]; unsigned i_c_len;
+	/* our KEXINIT payload (I_S), needed until it is folded into the exchange
+	 * hash at the client's KEXINIT. */
 	uint8_t      i_s[SSH_IS_SZ]; unsigned i_s_len;
 
-	/* key-exchange working values */
-	uint8_t      q_c[32];        /* client ephemeral public                    */
-	uint8_t      q_s[32];        /* server ephemeral public                    */
-	uint8_t      eph_sk[32];     /* server ephemeral secret                    */
-	uint8_t      k_raw[32];      /* raw X25519 shared secret                   */
-	uint8_t      kmpint[40];     /* shared secret encoded as an mpint (K)      */
-	unsigned     kmpint_len;
-	uint8_t      ks_blob[64];    /* host-key blob K_S                          */
-	unsigned     ks_len;
+	/* streaming exchange hash: V_C,V_S,I_C,I_S are folded in at KEXINIT and
+	 * K_S,Q_C,Q_S,K at KEX_ECDH_INIT, then finalised to H. This replaces the
+	 * per-slot I_C copy + one-shot preimage. */
+	sha256_ctx   hctx;
 
-	uint8_t      H[32];          /* exchange hash                              */
 	uint8_t      session_id[32]; /* = H of the first kex                       */
 	int          have_session_id;
 
@@ -130,17 +138,9 @@ typedef struct ssh_conn {
 	char         svc_name[64];   /* decoded SERVICE_REQUEST service name       */
 
 	/* ---- userauth (RFC 4252) ---------------------------------------- */
-	char         password[64];   /* configured secret; empty => open box       */
-	int          have_password;  /* 1 once ssh_set_password gave a non-empty pw */
 	int          authenticated;  /* 1 after SSH_MSG_USERAUTH_SUCCESS            */
 	unsigned     auth_fails;     /* wrong/rejected attempts (retry budget)      */
 	char         auth_user[64];  /* last requested user name (informational)    */
-	/* publickey auth (RFC 4252 sec 7): a pointer to the caller's persistent
-	 * [authkey_count][32] array of authorized ed25519 public keys (near data,
-	 * shared DGROUP), so the 32-byte keys are stored once, not per connection.
-	 * Empty => publickey unavailable. */
-	const uint8_t *authkeys;
-	unsigned       authkey_count;
 
 	/* ---- connection / session channel (RFC 4254) -------------------- */
 	int          chan_open;      /* a "session" channel is open                */
@@ -157,11 +157,6 @@ typedef struct ssh_conn {
 	int          chan_sent_eof;  /* we sent CHANNEL_EOF                          */
 	int          chan_sent_close;/* we sent CHANNEL_CLOSE                        */
 	int          chan_closed;    /* channel fully torn down                      */
-
-	/* decrypted client keystrokes waiting for ssh_channel_getc (ring) */
-	uint8_t      cin[SSH_CIN_SZ]; unsigned cin_head, cin_tail;
-	/* screen bytes staged by ssh_channel_putc, framed by ssh_channel_flush */
-	uint8_t      cout[SSH_COUT_SZ]; unsigned cout_len;
 } ssh_conn;
 
 /* Reset a connection and queue our version string + KEXINIT into the output
@@ -176,8 +171,16 @@ void DOSSH_FAR ssh_reset(ssh_conn *c, const uint8_t hostkey_sk[64],
 int DOSSH_FAR ssh_input(ssh_conn *c, const uint8_t *data, unsigned n);
 
 /* Copy up to max pending outbound bytes into buf, removing them from the queue.
- * Returns the number copied (0 when the queue is empty). Call in a loop. */
+ * Returns the number copied (0 when the queue is empty). Call in a loop. The
+ * outbound queue is a single SHARED buffer (see ssh.c), framed for whichever
+ * slot the tick is servicing and drained before the next - so drain it fully
+ * for one slot before touching another. */
 unsigned DOSSH_FAR ssh_output(ssh_conn *c, uint8_t *buf, unsigned max);
+
+/* Discard whatever is left in the shared outbound queue. Used on teardown, when
+ * a slot's transport is being aborted and its unsent bytes are moot - so they
+ * cannot leak into the next slot's stream if its ring was full. */
+void DOSSH_FAR ssh_discard_output(void);
 
 /* 1 once the transport is up and the client's SERVICE_REQUEST was decrypted.
  * (Latched; the machine keeps running through userauth and the channel.) */
@@ -231,8 +234,28 @@ int DOSSH_FAR ssh_channel_putc(ssh_conn *c, int byte);
 
 /* Frame staged bytes into CHANNEL_DATA packet(s), honouring the client's flow-
  * control window and max packet size; leftover stays buffered when the window
- * is exhausted. Mirrors net_tx_flush. */
+ * is exhausted. Mirrors net_tx_flush. (Single-client path: serial + the native
+ * harness. The multi-client net path uses ssh_channel_emit instead.) */
 void DOSSH_FAR ssh_channel_flush(ssh_conn *c);
+
+/* ---- multi-client screen tx: render once, encrypt per slot ---------
+ * The shared screen render is produced once (plaintext), then each ready slot
+ * frames+encrypts it with ITS OWN keys - no longer byte-identical across
+ * clients (docs/DESIGN-ssh.md sec 4). These let the caller pace that per slot
+ * without a per-slot staging buffer. */
+
+/* Max plaintext bytes this channel can accept in ONE CHANNEL_DATA packet right
+ * now: min(SSH_CHAN_CHUNK, peer_window, peer_maxpkt), or 0 if the channel is
+ * not a live byte pipe. */
+unsigned DOSSH_FAR ssh_channel_avail(ssh_conn *c);
+
+/* Frame n plaintext bytes (1..ssh_channel_avail) as ONE encrypted CHANNEL_DATA
+ * packet with this slot's keys into out[0..outmax); returns the wire length, or
+ * 0 on error/overflow/closed. Advances send_seq and consumes peer_window. The
+ * caller pushes the returned bytes onto this slot's transport. out needs room
+ * for n + ~32 bytes. */
+unsigned DOSSH_FAR ssh_channel_emit(ssh_conn *c, const uint8_t *plain,
+                                    unsigned n, uint8_t *out, unsigned outmax);
 
 /* Report the client's terminal size from pty-req/window-change (defaults
  * 80x25 until the client tells us). This is SSH's NAWS equivalent. */

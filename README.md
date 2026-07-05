@@ -142,11 +142,14 @@ box verifies the signature and never sees a password. Only `ssh-ed25519` keys ar
 accepted (the crypto library has no RSA), and password + key auth coexist.
 
 It speaks `curve25519-sha256` + `ssh-ed25519` + `chacha20-poly1305@openssh.com`,
-all computed on the DOS box from the timer tick. **Experimental / pre-1.0:** it is
-single-client, and DOS has no OS entropy source, so its keys are weaker than a
-real OS RNG (see [docs/DESIGN-ssh.md](docs/DESIGN-ssh.md)) — for a hardened setup
-the tunnel above is still the conservative choice. The default `DOSSHD.EXE`
-(telnet, 8086-compatible) is unchanged; SSH lives only in `DOSSHDS.EXE`.
+all computed on the DOS box from the timer tick, and it is **multi-client** — two
+or more people can `ssh` in at once to share and drive one console, each over its
+own encrypted session (the shared screen is rendered once and encrypted per
+client). **Experimental / pre-1.0:** DOS has no OS entropy source, so its keys
+are weaker than a real OS RNG (see [docs/DESIGN-ssh.md](docs/DESIGN-ssh.md)) — for
+a hardened setup the tunnel above is still the conservative choice. The default
+`DOSSHD.EXE` (telnet, 8086-compatible) is unchanged; SSH lives only in
+`DOSSHDS.EXE`.
 
 ## Roadmap
 
@@ -175,12 +178,16 @@ the tunnel above is still the conservative choice. The default `DOSSHD.EXE`
 - [x] **Native SSH server (experimental)** — a stock `ssh` client connects
       straight to the DOS box with real end-to-end encryption (curve25519 +
       ed25519 + chacha20-poly1305), terminating in the TSR from the timer tick.
-      Single-client (P1) in the separate `DOSSHDS.EXE` build; `test/e2e-ssh-dos.py`
-      drives a real OpenSSH client against a DOS box in QEMU.
+      In the separate `DOSSHDS.EXE` build; `test/e2e-ssh-dos.py` drives a real
+      OpenSSH client against a DOS box in QEMU.
 - [x] **SSH publickey auth** — drop an `ssh-ed25519` key in `AUTHKEYS` and
       `ssh -i` logs in with no password on the wire; the box verifies the
       signature (RFC 4252 §7). `test/e2e-ssh-pubkey.sh` proves it against OpenSSH.
-- [ ] SSH: multi-client encryption (P3).
+- [x] **SSH multi-client (P3)** — several `ssh` clients share and drive one
+      console at once, each over its own session keys: the shared screen is
+      rendered once then framed + encrypted per client, and their keystrokes
+      merge (like the telnet path). `test/e2e-ssh-multiclient.py` drives TWO real
+      `ssh` clients against one DOS box in QEMU.
 - [x] Transport encryption — the native SSH build above, or a tunnel
       (`ssh -L` / VPN / stunnel — see docs/SECURITY.md).
 

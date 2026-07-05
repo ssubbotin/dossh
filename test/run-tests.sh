@@ -65,6 +65,12 @@ done
 echo "-- e2e-ssh-dos --"
 python3 test/e2e-ssh-dos.py || { echo "FAILED: e2e-ssh-dos"; exit 1; }
 
+# Multi-client native in-DOS SSH (the P3 milestone): TWO stock `ssh` clients
+# drive/watch one FreeDOS console at once, each over its own SSH session (its own
+# keys); render once, encrypt per client. The SSH analogue of e2e-m5-multiclient.
+echo "-- e2e-ssh-multiclient --"
+python3 test/e2e-ssh-multiclient.py || { echo "FAILED: e2e-ssh-multiclient"; exit 1; }
+
 # Opt-in NDIS2/DIS_PKT smoke test - builds a net floppy with net/mkbootdisk.sh
 # and drives DOSSHD over an emulated NIC. Skips unless DOSSH_DRIVERS is set (the
 # DOS networking stack is vendor-supplied; see docs/NETWORKING.md).

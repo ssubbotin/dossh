@@ -63,14 +63,50 @@
 #define OPEN_UNKNOWN_CHANNEL_TYPE        3
 
 /*
- * Transient scratch for the exchange-hash preimage and the KDF. It is written
- * and consumed entirely within a single kex step and never carries state
- * between calls, so a file-static (shared, non-reentrant) buffer is correct
- * for the cooperative tick and saves per-slot DGROUP - the same pattern rng.c
- * uses. Sized for the largest preimage: string-wrapped V_C, V_S, I_C, I_S,
- * K_S, Q_C, Q_S plus the mpint K.
+ * ---- SHARED transient scratch (one copy, reused per slot in the tick) ------
+ * The cooperative tick services one slot at a time and never re-enters, so all
+ * of the following are file-static (shared) instead of replicated per slot -
+ * this is what makes ssh_slots[NCONN] fit DGROUP (docs/DESIGN-ssh.md sec 4).
+ * Each is written and fully consumed while servicing a SINGLE slot, before the
+ * next slot is touched:
+ *   - g_ob    the outbound drain buffer: a slot's replies are framed here and
+ *             drained to that slot's transport before the next slot is served.
+ *   - the ECDH working values (g_q_c..g_H): computed and consumed inside one
+ *             KEX_ECDH_INIT step.
+ *   - g_cin   the decrypted-keystroke ring: filled by a slot's ssh_input and
+ *             drained by the caller before the next slot's ssh_input.
+ *   - g_cout  screen staging for the single-client putc/flush path (serial +
+ *             the native harness); the multi-client net path uses ssh_channel_emit.
+ *   - g_scratch the publickey signed-data preimage. Bounded by the packet size
+ *             (a USERAUTH_REQUEST fits ib), so SSH_IB_SZ + slack is enough.
  */
-static uint8_t g_scratch[SSH_IC_SZ + SSH_IS_SZ + 512];
+static uint8_t  g_ob[SSH_OB_SZ]; static unsigned g_ob_len;
+
+static uint8_t  g_q_c[32];       /* client ephemeral public                    */
+static uint8_t  g_q_s[32];       /* server ephemeral public                    */
+static uint8_t  g_eph_sk[32];    /* server ephemeral secret                    */
+static uint8_t  g_k_raw[32];     /* raw X25519 shared secret                   */
+static uint8_t  g_kmpint[40];    /* shared secret encoded as an mpint (K)      */
+static unsigned g_kmpint_len;
+static uint8_t  g_ks_blob[64];   /* host-key blob K_S                          */
+static unsigned g_ks_len;
+static uint8_t  g_H[32];         /* exchange hash of the step in progress      */
+
+static uint8_t  g_cin[SSH_CIN_SZ]; static unsigned g_cin_head, g_cin_tail;
+static uint8_t  g_cout[SSH_COUT_SZ]; static unsigned g_cout_len;
+
+static uint8_t  g_scratch[SSH_IB_SZ + 128];
+
+/* ---- SHARED configuration (the same for every client) --------------------
+ * Set once (ssh_reset / ssh_set_password / ssh_set_authorized_keys) and read by
+ * every slot; a server has one host key, one password gate and one authorized-
+ * key set, so these are not per-slot state. */
+static uint8_t  g_hostkey_sk[64];
+static uint8_t  g_hostkey_pk[32];
+static char     g_password[64];
+static int      g_have_password;
+static const uint8_t *g_authkeys;
+static unsigned g_authkey_count;
 
 /* ---- small byte helpers -------------------------------------------- */
 
@@ -123,9 +159,9 @@ static void fail(ssh_conn *c, const char *why)
 
 static void ob_append(ssh_conn *c, const uint8_t *d, unsigned n)
 {
-	if (c->ob_len + n > SSH_OB_SZ) { fail(c, "output overflow"); return; }
-	memcpy(c->ob + c->ob_len, d, n);
-	c->ob_len += n;
+	if (g_ob_len + n > SSH_OB_SZ) { fail(c, "output overflow"); return; }
+	memcpy(g_ob + g_ob_len, d, n);
+	g_ob_len += n;
 }
 
 /* drop k consumed bytes from the front of the inbound buffer */
@@ -156,44 +192,52 @@ static void send_unenc(ssh_conn *c, const uint8_t *payload, unsigned plen)
 	c->send_seq++;
 }
 
+/* Largest payload a single encrypted packet body accepts (padlen + payload +
+ * up to 8 pad, kept under the old body[256] limit). */
+#define SSH_ENC_MAX_PLEN  247
+
 /*
- * chacha20-poly1305@openssh.com packet (RFC-style body, OpenSSH framing):
+ * chacha20-poly1305@openssh.com packet (RFC-style body, OpenSSH framing), sealed
+ * into the caller's buffer out[0..] with slot c's server->client keys and
+ * sequence number; returns the wire length (4 + pkt_len + 16). Advances
+ * c->send_seq. out must hold plen + 32 bytes. Layout:
  *   enc_len(4)  = packet_length XOR header-key keystream (ctr 0)
  *   enc_body(N) = [padlen | payload | padding] XOR main-key keystream (ctr 1)
  *   tag(16)     = Poly1305(enc_len || enc_body), key = main-key block 0 [0..31]
  * The 4-byte length field is NOT counted in the block-size padding here.
  */
-static void send_enc(ssh_conn *c, const uint8_t *payload, unsigned plen)
+static unsigned aead_seal(ssh_conn *c, const uint8_t *payload, unsigned plen,
+                          uint8_t *out)
 {
 	uint8_t *k_main   = c->ek_s2c;        /* [0..31]  */
 	uint8_t *k_header = c->ek_s2c + 32;   /* [32..63] */
-	uint8_t nonce[8], enc_len[4], polykey[32], tag[16], body[256];
-	unsigned padlen, pkt_len, start;
-
-	if (1 + plen + 8 > sizeof(body)) { fail(c, "enc payload too large"); return; }
+	uint8_t nonce[8], polykey[32];
+	unsigned padlen, pkt_len;
 
 	padlen = 8 - ((1 + plen) % 8);
 	if (padlen < 4) padlen += 8;
 	pkt_len = 1 + plen + padlen;
 
-	body[0] = (uint8_t)padlen;
-	if (plen) memcpy(body + 1, payload, plen);
-	rng_bytes(body + 1 + plen, padlen);
+	out[4] = (uint8_t)padlen;             /* body assembled in place at out+4 */
+	if (plen) memcpy(out + 5, payload, plen);
+	rng_bytes(out + 5 + plen, padlen);
 
 	seqbuf8(c->send_seq, nonce);
-
-	put_u32(enc_len, pkt_len);
-	dossh_chacha20_djb(enc_len, enc_len, 4, k_header, nonce, 0);
+	put_u32(out, pkt_len);
+	dossh_chacha20_djb(out, out, 4, k_header, nonce, 0);            /* enc length */
 	dossh_chacha20_djb(polykey, (const uint8_t *)0, 32, k_main, nonce, 0);
-	dossh_chacha20_djb(body, body, pkt_len, k_main, nonce, 1);
-
-	start = c->ob_len;
-	ob_append(c, enc_len, 4);
-	ob_append(c, body, pkt_len);
-	if (c->state == SSH_ST_ERROR) return;
-	dossh_poly1305(tag, c->ob + start, 4 + pkt_len, polykey);
-	ob_append(c, tag, 16);
+	dossh_chacha20_djb(out + 4, out + 4, pkt_len, k_main, nonce, 1);/* enc body   */
+	dossh_poly1305(out + 4 + pkt_len, out, 4 + pkt_len, polykey);
 	c->send_seq++;
+	return 4 + pkt_len + 16;
+}
+
+static void send_enc(ssh_conn *c, const uint8_t *payload, unsigned plen)
+{
+	uint8_t wire[4 + 256 + 16];
+
+	if (plen > SSH_ENC_MAX_PLEN) { fail(c, "enc payload too large"); return; }
+	ob_append(c, wire, aead_seal(c, payload, plen, wire));
 }
 
 static void send_packet(ssh_conn *c, const uint8_t *payload, unsigned plen)
@@ -258,11 +302,12 @@ static void build_our_kexinit(ssh_conn *c)
 	c->i_s_len = o;
 }
 
-/* verify the client offers what we require and set up the guess handling */
-static int negotiate(ssh_conn *c)
+/* verify the client offers what we require and set up the guess handling.
+ * pl/len is the client's KEXINIT payload (I_C) read straight from ib. */
+static int negotiate(ssh_conn *c, const uint8_t *p, unsigned len)
 {
-	const uint8_t *p = c->i_c, *lists[10];
-	unsigned len = c->i_c_len, off = 17, llen[10];   /* skip msg(1)+cookie(16) */
+	const uint8_t *lists[10];
+	unsigned off = 17, llen[10];                     /* skip msg(1)+cookie(16) */
 	const uint8_t *tok; unsigned tlen;
 	int idx, kex_ok, hk_ok;
 
@@ -294,45 +339,46 @@ static int negotiate(ssh_conn *c)
 
 /* ---- exchange hash + key derivation -------------------------------- */
 
-/* encode the raw 32-byte shared secret as an SSH mpint (into c->kmpint) */
-static void build_kmpint(ssh_conn *c)
+/* encode the raw 32-byte shared secret as an SSH mpint (into g_kmpint) */
+static void build_kmpint(void)
 {
-	const uint8_t *v = c->k_raw;
+	const uint8_t *v = g_k_raw;
 	unsigned i = 0, o, n, pad;
 
 	while (i < 32 && v[i] == 0) i++;
 	n = 32 - i;
-	if (n == 0) { put_u32(c->kmpint, 0); c->kmpint_len = 4; return; }
+	if (n == 0) { put_u32(g_kmpint, 0); g_kmpint_len = 4; return; }
 	pad = (v[i] & 0x80) ? 1 : 0;
-	put_u32(c->kmpint, n + pad); o = 4;
-	if (pad) c->kmpint[o++] = 0;
-	memcpy(c->kmpint + o, v + i, n); o += n;
-	c->kmpint_len = o;
+	put_u32(g_kmpint, n + pad); o = 4;
+	if (pad) g_kmpint[o++] = 0;
+	memcpy(g_kmpint + o, v + i, n); o += n;
+	g_kmpint_len = o;
 }
 
-static void build_ks_blob(ssh_conn *c)
+static void build_ks_blob(void)
 {
 	unsigned o = 0;
-	o += put_str(c->ks_blob + o, (const uint8_t *)"ssh-ed25519", 11);
-	o += put_str(c->ks_blob + o, c->hostkey_pk, 32);
-	c->ks_len = o;
+	o += put_str(g_ks_blob + o, (const uint8_t *)"ssh-ed25519", 11);
+	o += put_str(g_ks_blob + o, g_hostkey_pk, 32);
+	g_ks_len = o;
 }
 
-/* H = SHA256( string(V_C) string(V_S) string(I_C) string(I_S)
- *             string(K_S) string(Q_C) string(Q_S) mpint(K) ) */
-static void compute_H(ssh_conn *c)
+/*
+ * Streaming exchange hash (RFC 4253 sec 8):
+ *   H = SHA256( string(V_C) string(V_S) string(I_C) string(I_S)
+ *               string(K_S) string(Q_C) string(Q_S) mpint(K) )
+ * hash_str feeds one length-prefixed SSH string into the running SHA-256.
+ * V_C,V_S,I_C,I_S are folded in at the client's KEXINIT (all four are known by
+ * then); K_S,Q_C,Q_S,K are folded in at KEX_ECDH_INIT and the digest finalised.
+ * Byte-for-byte identical to the old one-shot preimage, but without buffering
+ * the whole transcript per slot.
+ */
+static void hash_str(sha256_ctx *h, const uint8_t *s, unsigned n)
 {
-	unsigned o = 0;
-	o += put_str(g_scratch + o, (const uint8_t *)c->cli_ver, c->cli_ver_len);
-	o += put_str(g_scratch + o, (const uint8_t *)SERVER_ID,
-	             (unsigned)strlen(SERVER_ID));
-	o += put_str(g_scratch + o, c->i_c, c->i_c_len);
-	o += put_str(g_scratch + o, c->i_s, c->i_s_len);
-	o += put_str(g_scratch + o, c->ks_blob, c->ks_len);
-	o += put_str(g_scratch + o, c->q_c, 32);
-	o += put_str(g_scratch + o, c->q_s, 32);
-	memcpy(g_scratch + o, c->kmpint, c->kmpint_len); o += c->kmpint_len;
-	dossh_sha256(c->H, g_scratch, o);
+	uint8_t lp[4];
+	put_u32(lp, n);
+	sha256_update(h, lp, 4);
+	if (n) sha256_update(h, s, n);
 }
 
 /*
@@ -340,7 +386,7 @@ static void compute_H(ssh_conn *c)
  *   K1 = HASH(K || H || <letter> || session_id)
  *   Kn = HASH(K || H || K1 || ... || K(n-1))
  *   key = K1 || K2 || ...   (truncated to outlen)
- * K is the mpint encoding (c->kmpint), H is 32 bytes, session_id is 32 bytes.
+ * K is the mpint encoding (g_kmpint), H is 32 bytes, session_id is 32 bytes.
  */
 static void derive_key(ssh_conn *c, uint8_t letter, uint8_t *out, unsigned outlen)
 {
@@ -348,8 +394,8 @@ static void derive_key(ssh_conn *c, uint8_t letter, uint8_t *out, unsigned outle
 	unsigned blen, produced, take;
 
 	blen = 0;
-	memcpy(buf, c->kmpint, c->kmpint_len);        blen = c->kmpint_len;
-	memcpy(buf + blen, c->H, 32);                 blen += 32;
+	memcpy(buf, g_kmpint, g_kmpint_len);          blen = g_kmpint_len;
+	memcpy(buf + blen, g_H, 32);                  blen += 32;
 	buf[blen++] = letter;
 	memcpy(buf + blen, c->session_id, 32);        blen += 32;
 	dossh_sha256(block, buf, blen);
@@ -358,8 +404,8 @@ static void derive_key(ssh_conn *c, uint8_t letter, uint8_t *out, unsigned outle
 
 	while (produced < outlen) {
 		blen = 0;
-		memcpy(buf, c->kmpint, c->kmpint_len);    blen = c->kmpint_len;
-		memcpy(buf + blen, c->H, 32);             blen += 32;
+		memcpy(buf, g_kmpint, g_kmpint_len);      blen = g_kmpint_len;
+		memcpy(buf + blen, g_H, 32);              blen += 32;
 		memcpy(buf + blen, out, produced);        blen += produced;
 		dossh_sha256(block, buf, blen);
 		take = (outlen - produced) < 32 ? (outlen - produced) : 32;
@@ -374,11 +420,19 @@ static void derive_key(ssh_conn *c, uint8_t letter, uint8_t *out, unsigned outle
 static void handle_kexinit(ssh_conn *c, const uint8_t *pl, unsigned plen)
 {
 	int r;
-	if (plen > SSH_IC_SZ) { fail(c, "KEXINIT too large"); return; }
-	memcpy(c->i_c, pl, plen); c->i_c_len = plen;
-	r = negotiate(c);
+	r = negotiate(c, pl, plen);
 	if (r == -1) { fail(c, "malformed KEXINIT"); return; }
 	if (r == -2) { fail(c, "no common algorithm"); return; }
+
+	/* fold the first four transcript pieces into the running exchange hash
+	 * now that I_C has arrived (V_C, V_S and I_S are already known). The rest
+	 * (K_S, Q_C, Q_S, K) follow at KEX_ECDH_INIT. */
+	sha256_init(&c->hctx);
+	hash_str(&c->hctx, (const uint8_t *)c->cli_ver, c->cli_ver_len);       /* V_C */
+	hash_str(&c->hctx, (const uint8_t *)SERVER_ID, (unsigned)strlen(SERVER_ID)); /* V_S */
+	hash_str(&c->hctx, pl, plen);                                          /* I_C */
+	hash_str(&c->hctx, c->i_s, c->i_s_len);                                /* I_S */
+
 	c->state = SSH_ST_EXPECT_ECDH_INIT;
 }
 
@@ -391,37 +445,43 @@ static void handle_ecdh_init(ssh_conn *c, const uint8_t *pl, unsigned plen)
 	if (plen < 5) { fail(c, "short KEX_ECDH_INIT"); return; }
 	qlen = rd_u32(pl + 1);
 	if (qlen != 32 || 1 + 4 + qlen > plen) { fail(c, "bad Q_C"); return; }
-	memcpy(c->q_c, pl + 5, 32);
+	memcpy(g_q_c, pl + 5, 32);
 
 	/* server ephemeral + shared secret */
-	rng_bytes(c->eph_sk, 32);
-	dossh_x25519_public_key(c->q_s, c->eph_sk);
-	dossh_x25519(c->k_raw, c->eph_sk, c->q_c);
+	rng_bytes(g_eph_sk, 32);
+	dossh_x25519_public_key(g_q_s, g_eph_sk);
+	dossh_x25519(g_k_raw, g_eph_sk, g_q_c);
 
 	/* reject a low-order Q_C that forces an all-zero shared secret */
 	{
 		uint8_t z = 0;
-		for (o = 0; o < 32; o++) z |= c->k_raw[o];
+		for (o = 0; o < 32; o++) z |= g_k_raw[o];
 		if (z == 0) { fail(c, "degenerate shared secret"); return; }
 	}
 
-	build_kmpint(c);
-	build_ks_blob(c);
-	compute_H(c);
+	build_kmpint();
+	build_ks_blob();
+
+	/* finish the streaming exchange hash: K_S, Q_C, Q_S, mpint(K) -> H */
+	hash_str(&c->hctx, g_ks_blob, g_ks_len);        /* K_S */
+	hash_str(&c->hctx, g_q_c, 32);                  /* Q_C */
+	hash_str(&c->hctx, g_q_s, 32);                  /* Q_S */
+	sha256_update(&c->hctx, g_kmpint, g_kmpint_len);/* mpint(K), length-prefixed */
+	sha256_final(&c->hctx, g_H);
 	if (!c->have_session_id) {
-		memcpy(c->session_id, c->H, 32);
+		memcpy(c->session_id, g_H, 32);
 		c->have_session_id = 1;
 	}
 
 	/* SSH_MSG_KEX_ECDH_REPLY: K_S, Q_S, signature-of-H blob */
-	dossh_ed25519_sign(sig, c->hostkey_sk, c->H, 32);
+	dossh_ed25519_sign(sig, g_hostkey_sk, g_H, 32);
 	so  = put_str(sigblob, (const uint8_t *)"ssh-ed25519", 11);
 	so += put_str(sigblob + so, sig, 64);
 
 	o = 0;
 	rep[o++] = MSG_KEX_ECDH_REPLY;
-	o += put_str(rep + o, c->ks_blob, c->ks_len);
-	o += put_str(rep + o, c->q_s, 32);
+	o += put_str(rep + o, g_ks_blob, g_ks_len);
+	o += put_str(rep + o, g_q_s, 32);
 	o += put_str(rep + o, sigblob, so);
 	send_packet(c, rep, o);
 
@@ -479,8 +539,8 @@ static void send_userauth_failure(ssh_conn *c)
 	/* Advertise exactly the methods that can still authenticate, so a client
 	 * with an authorized key tries publickey (and never puts a secret on the
 	 * wire) while password still works otherwise. */
-	if (c->authkey_count) { memcpy(methods + m, "publickey", 9); m += 9; }
-	if (c->have_password) {
+	if (g_authkey_count) { memcpy(methods + m, "publickey", 9); m += 9; }
+	if (g_have_password) {
 		if (m) methods[m++] = ',';
 		memcpy(methods + m, "password", 8); m += 8;
 	}
@@ -578,11 +638,11 @@ static const uint8_t *ed25519_sig_from_blob(const uint8_t *sb, unsigned sblen)
 
 /* Is this 32-byte ed25519 public key in the configured authorized set? Keys are
  * public, so a plain compare is fine (no secret-dependent timing here). */
-static int authkey_is_authorized(ssh_conn *c, const uint8_t *key)
+static int authkey_is_authorized(const uint8_t *key)
 {
 	unsigned i;
-	for (i = 0; i < c->authkey_count; i++)
-		if (memcmp(c->authkeys + (unsigned)i * 32, key, 32) == 0)
+	for (i = 0; i < g_authkey_count; i++)
+		if (memcmp(g_authkeys + (unsigned)i * 32, key, 32) == 0)
 			return 1;
 	return 0;
 }
@@ -608,8 +668,9 @@ static void send_pk_ok(ssh_conn *c, const uint8_t *algo, unsigned algolen,
  *   string(service) string("publickey") boolean(TRUE)
  *   string(pubkey-algorithm) string(pubkey-blob)
  * The user/service/algo/blob bytes are used verbatim as the client sent them.
- * g_scratch (>= 3 KB) is free after key exchange, so no extra DGROUP is spent.
- * Returns the length written. */
+ * All four came out of one packet that fit ib, so the preimage fits g_scratch
+ * (sized SSH_IB_SZ + slack); the guard rejects any pathological overrun anyway.
+ * Returns the length written, or 0 if it would not fit. */
 static unsigned build_pk_signed_data(ssh_conn *c,
         const uint8_t *user, unsigned ulen,
         const uint8_t *service, unsigned slen,
@@ -617,6 +678,9 @@ static unsigned build_pk_signed_data(ssh_conn *c,
         const uint8_t *blob, unsigned bloblen)
 {
 	unsigned o = 0;
+	unsigned need = (4 + 32) + 1 + (4 + ulen) + (4 + slen) + (4 + 9)
+	              + 1 + (4 + algolen) + (4 + bloblen);
+	if (need > sizeof(g_scratch)) return 0;
 	o += put_str(g_scratch + o, c->session_id, 32);
 	g_scratch[o++] = MSG_USERAUTH_REQUEST;
 	o += put_str(g_scratch + o, user, ulen);
@@ -660,7 +724,7 @@ static void handle_pubkey_auth(ssh_conn *c, const uint8_t *pl, unsigned plen,
 	key = ed25519_key_from_blob(blob, bloblen);
 	if (!key) { auth_reject(c, 1); return; }
 
-	authorized = authkey_is_authorized(c, key);
+	authorized = authkey_is_authorized(key);
 
 	if (!have_sig) {                    /* PROBE: PK_OK only, never SUCCESS */
 		if (!authorized) { auth_reject(c, 1); return; }
@@ -679,7 +743,7 @@ static void handle_pubkey_auth(ssh_conn *c, const uint8_t *pl, unsigned plen,
 	if (!authorized) { auth_reject(c, 1); return; }
 	dlen = build_pk_signed_data(c, user, ulen, service, slen,
 	                            algo, algolen, blob, bloblen);
-	if (dossh_ed25519_verify(rawsig, key, g_scratch, dlen) == 0)
+	if (dlen && dossh_ed25519_verify(rawsig, key, g_scratch, dlen) == 0)
 		send_userauth_success(c);
 	else
 		auth_reject(c, 1);
@@ -700,22 +764,22 @@ static void handle_userauth_request(ssh_conn *c, const uint8_t *pl, unsigned ple
 	/* Open box (no /P equivalent, no authorized keys): admit the first attempt,
 	 * any method. Once a password OR authorized keys are configured, the box is
 	 * gated and only a matching credential authenticates. */
-	if (!c->have_password && !c->authkey_count) { send_userauth_success(c); return; }
+	if (!g_have_password && !g_authkey_count) { send_userauth_success(c); return; }
 
 	if (mlen == 9 && memcmp(method, "publickey", 9) == 0) {
-		if (!c->authkey_count) { auth_reject(c, 1); return; }  /* not offered */
+		if (!g_authkey_count) { auth_reject(c, 1); return; }  /* not offered */
 		handle_pubkey_auth(c, pl, plen, o, user, ulen, service, slen);
 		return;
 	}
 
-	if (c->have_password && mlen == 8 && memcmp(method, "password", 8) == 0) {
+	if (g_have_password && mlen == 8 && memcmp(method, "password", 8) == 0) {
 		unsigned pwlen, want;
 		const uint8_t *pw;
 		if (o + 1 > plen) { auth_reject(c, 1); return; }
 		if (pl[o++]) { auth_reject(c, 1); return; }  /* change-password: no */
 		if (!rd_string(pl, plen, &o, &pw, &pwlen)) { auth_reject(c, 1); return; }
-		want = (unsigned)strlen(c->password);
-		if (pwlen == want && memcmp(pw, c->password, want) == 0)
+		want = (unsigned)strlen(g_password);
+		if (pwlen == want && memcmp(pw, g_password, want) == 0)
 			send_userauth_success(c);
 		else
 			auth_reject(c, 1);
@@ -848,10 +912,10 @@ static void handle_channel_data(ssh_conn *c, const uint8_t *pl, unsigned plen)
 	dlen = rd_u32(pl + 5);
 	if (9 + dlen > plen) dlen = plen - 9;          /* clamp to what arrived  */
 	for (i = 0; i < dlen; i++) {
-		unsigned next = (c->cin_tail + 1) % SSH_CIN_SZ;
-		if (next == c->cin_head) break;            /* ring full: drop the rest */
-		c->cin[c->cin_tail] = pl[9 + i];
-		c->cin_tail = next;
+		unsigned next = (g_cin_tail + 1) % SSH_CIN_SZ;
+		if (next == g_cin_head) break;             /* ring full: drop the rest */
+		g_cin[g_cin_tail] = pl[9 + i];
+		g_cin_tail = next;
 	}
 	adjust_local_window(c, dlen);
 }
@@ -1012,9 +1076,15 @@ void DOSSH_FAR ssh_reset(ssh_conn *c, const uint8_t hostkey_sk[64],
                          const uint8_t hostkey_pk[32])
 {
 	memset(c, 0, sizeof(*c));
-	memcpy(c->hostkey_sk, hostkey_sk, 64);
-	memcpy(c->hostkey_pk, hostkey_pk, 32);
+	memcpy(g_hostkey_sk, hostkey_sk, 64);   /* shared: one host key per server */
+	memcpy(g_hostkey_pk, hostkey_pk, 32);
 	c->state = SSH_ST_VERSION;
+
+	/* the shared transient buffers belong to whichever slot the tick is now
+	 * servicing; start them empty for this connection's first output. */
+	g_ob_len = 0;
+	g_cin_head = g_cin_tail = 0;
+	g_cout_len = 0;
 
 	ob_append(c, (const uint8_t *)SERVER_ID_CRLF,
 	          (unsigned)strlen(SERVER_ID_CRLF));
@@ -1038,14 +1108,17 @@ int DOSSH_FAR ssh_input(ssh_conn *c, const uint8_t *data, unsigned n)
 
 unsigned DOSSH_FAR ssh_output(ssh_conn *c, uint8_t *buf, unsigned max)
 {
-	unsigned n = c->ob_len < max ? c->ob_len : max;
+	unsigned n = g_ob_len < max ? g_ob_len : max;
+	(void)c;                             /* the drain buffer is shared (g_ob) */
 	if (n) {
-		memcpy(buf, c->ob, n);
-		if (n < c->ob_len) memmove(c->ob, c->ob + n, c->ob_len - n);
-		c->ob_len -= n;
+		memcpy(buf, g_ob, n);
+		if (n < g_ob_len) memmove(g_ob, g_ob + n, g_ob_len - n);
+		g_ob_len -= n;
 	}
 	return n;
 }
+
+void DOSSH_FAR ssh_discard_output(void) { g_ob_len = 0; }
 
 int DOSSH_FAR ssh_done(ssh_conn *c)   { return c->done; }
 int DOSSH_FAR ssh_failed(ssh_conn *c) { return c->state == SSH_ST_ERROR; }
@@ -1071,17 +1144,19 @@ const char * DOSSH_FAR ssh_state_name(ssh_conn *c)
 void DOSSH_FAR ssh_set_password(ssh_conn *c, const char *pw)
 {
 	unsigned k = 0;
+	(void)c;                            /* the password gate is shared (global) */
 	if (pw)
-		while (pw[k] && k < sizeof(c->password) - 1) { c->password[k] = pw[k]; k++; }
-	c->password[k] = 0;
-	c->have_password = (k > 0);
+		while (pw[k] && k < sizeof(g_password) - 1) { g_password[k] = pw[k]; k++; }
+	g_password[k] = 0;
+	g_have_password = (k > 0);
 }
 
 void DOSSH_FAR ssh_set_authorized_keys(ssh_conn *c, const uint8_t *keys,
                                        unsigned count)
 {
-	c->authkeys = keys;                 /* [count][32] ed25519 public keys */
-	c->authkey_count = count;
+	(void)c;                            /* the authorized-key set is shared     */
+	g_authkeys = keys;                  /* [count][32] ed25519 public keys      */
+	g_authkey_count = count;
 }
 
 /* base64 value of one character, or -1 if it is not a base64 digit */
@@ -1163,17 +1238,18 @@ int DOSSH_FAR ssh_channel_ready(ssh_conn *c)
 int DOSSH_FAR ssh_channel_getc(ssh_conn *c)
 {
 	int b;
-	if (c->cin_head == c->cin_tail) return -1;
-	b = c->cin[c->cin_head];
-	c->cin_head = (c->cin_head + 1) % SSH_CIN_SZ;
+	(void)c;                            /* the keystroke ring is shared (g_cin) */
+	if (g_cin_head == g_cin_tail) return -1;
+	b = g_cin[g_cin_head];
+	g_cin_head = (g_cin_head + 1) % SSH_CIN_SZ;
 	return b;
 }
 
 int DOSSH_FAR ssh_channel_putc(ssh_conn *c, int byte)
 {
 	if (!c->shell_ready || c->chan_closed) return 0;
-	if (c->cout_len >= SSH_COUT_SZ)         return 0;   /* staging buffer full */
-	c->cout[c->cout_len++] = (uint8_t)byte;
+	if (g_cout_len >= SSH_COUT_SZ)          return 0;   /* staging buffer full */
+	g_cout[g_cout_len++] = (uint8_t)byte;
 	return 1;
 }
 
@@ -1181,23 +1257,23 @@ void DOSSH_FAR ssh_channel_flush(ssh_conn *c)
 {
 	unsigned sent = 0;
 
-	if (!c->chan_open || c->chan_closed) { c->cout_len = 0; return; }
+	if (!c->chan_open || c->chan_closed) { g_cout_len = 0; return; }
 
-	while (sent < c->cout_len) {
+	while (sent < g_cout_len) {
 		uint8_t pkt[9 + SSH_CHAN_CHUNK];
-		unsigned take = c->cout_len - sent, o;
+		unsigned take = g_cout_len - sent, o;
 
 		if (take > SSH_CHAN_CHUNK)   take = SSH_CHAN_CHUNK;
 		if (take > c->peer_window)   take = c->peer_window;
 		if (take > c->peer_maxpkt)   take = c->peer_maxpkt;
 		if (take == 0) break;                       /* window exhausted */
 		/* leave room in the drain buffer so send_enc never overflows */
-		if (c->ob_len + take + 64 > SSH_OB_SZ) break;
+		if (g_ob_len + take + 64 > SSH_OB_SZ) break;
 
 		o = 0;
 		pkt[o++] = MSG_CHANNEL_DATA;
 		put_u32(pkt + o, c->peer_chan); o += 4;
-		o += put_str(pkt + o, c->cout + sent, take);
+		o += put_str(pkt + o, g_cout + sent, take);
 		send_packet(c, pkt, o);
 		if (c->state == SSH_ST_ERROR) break;
 		c->peer_window -= take;
@@ -1205,10 +1281,42 @@ void DOSSH_FAR ssh_channel_flush(ssh_conn *c)
 	}
 
 	if (sent) {
-		if (sent >= c->cout_len) c->cout_len = 0;
-		else { memmove(c->cout, c->cout + sent, c->cout_len - sent);
-		       c->cout_len -= sent; }
+		if (sent >= g_cout_len) g_cout_len = 0;
+		else { memmove(g_cout, g_cout + sent, g_cout_len - sent);
+		       g_cout_len -= sent; }
 	}
+}
+
+/* ---- multi-client screen tx: render once, encrypt per slot --------- */
+
+unsigned DOSSH_FAR ssh_channel_avail(ssh_conn *c)
+{
+	unsigned a;
+	if (!ssh_channel_ready(c)) return 0;
+	a = SSH_CHAN_CHUNK;
+	if ((uint32_t)a > c->peer_window) a = (unsigned)c->peer_window;
+	if ((uint32_t)a > c->peer_maxpkt) a = (unsigned)c->peer_maxpkt;
+	return a;
+}
+
+unsigned DOSSH_FAR ssh_channel_emit(ssh_conn *c, const uint8_t *plain,
+                                    unsigned n, uint8_t *out, unsigned outmax)
+{
+	uint8_t pkt[9 + SSH_CHAN_CHUNK];
+	unsigned o = 0;
+
+	if (!ssh_channel_ready(c) || !c->send_encrypted) return 0;
+	if (n == 0 || n > SSH_CHAN_CHUNK) return 0;
+	if ((uint32_t)n > c->peer_window || (uint32_t)n > c->peer_maxpkt) return 0;
+	/* wire = 4 (enc len) + (1 + payload + up to 8 pad) + 16 (tag); payload is
+	 * 9 + n, so an outmax of n + 40 is always enough. */
+	if ((unsigned long)n + 40 > outmax) return 0;
+
+	pkt[o++] = MSG_CHANNEL_DATA;
+	put_u32(pkt + o, c->peer_chan); o += 4;
+	o += put_str(pkt + o, plain, n);      /* o = 9 + n <= SSH_ENC_MAX_PLEN */
+	c->peer_window -= n;
+	return aead_seal(c, pkt, o, out);
 }
 
 void DOSSH_FAR ssh_winsize(ssh_conn *c, int *cols, int *rows)

@@ -688,6 +688,22 @@ int net_tx_room_slot( int i )
     used = (c->s_end - c->s_una) & SND_MASK;
     return (int)( (SND_SZ - 1) - used );
 }
+
+/* 1 if slot i's send ring is full AND its peer has stopped ACKing - i.e. a dead
+ * client the broadcast should evict rather than pace to (the same condition
+ * net_tx_putc uses to drop a stalled telnet client). */
+int net_slot_stalled( int i )
+{
+    struct conn *c;
+    unsigned used;
+    if( i < 0 || i >= NCONN )
+        return 0;
+    c = &conns[i];
+    if( c->tstate != TS_ESTAB )
+        return 0;
+    used = (c->s_end - c->s_una) & SND_MASK;
+    return ( used >= SND_SZ - 1 ) && ( c->rexmit_count > 0 );
+}
 #endif
 
 int net_rx_getc( int i )
