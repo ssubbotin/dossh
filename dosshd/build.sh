@@ -71,6 +71,8 @@ done
 # preview of that build. The base non-SSH DOSSHD above stays small model -0.
 # Proves the -3 crypto objects compile AND link into a real DOS EXE clean;
 # test/cryptot.c runs two of the known-answer vectors on target.
+# $CRYPTO_OBJ is a space-separated object-file list that must word-split.
+# shellcheck disable=SC2086
 wcl -zq -bcl=dos -mm -3 -os -dDOSSH_SSH_SUBSET -i=crypto \
     -fe=cryptot.exe ../test/cryptot.c $CRYPTO_OBJ
 cp -f cryptot.exe CRYPTOT.EXE 2>/dev/null || true
@@ -84,6 +86,8 @@ cp -f cryptot.exe CRYPTOT.EXE 2>/dev/null || true
 # would build. The FUNCTIONAL interop proof is native: test/sshd_native.c drives
 # the same ssh.c against a stock OpenSSH client (test/e2e-ssh-transport.sh).
 wcc -zq -bt=dos -mm -3 -os -s -zastd=c99 -dDOSSH_SSH_SUBSET -i=crypto -fo=ssh.o ssh.c
+# $CRYPTO_OBJ is a space-separated object-file list that must word-split.
+# shellcheck disable=SC2086
 wcl -zq -bcl=dos -mm -3 -os -dDOSSH_SSH_SUBSET -i=. -i=crypto \
     -fe=sshlink.exe ../test/sshlink.c ssh.o $CRYPTO_OBJ
 cp -f sshlink.exe SSHLINK.EXE 2>/dev/null || true
@@ -107,6 +111,8 @@ for f in dosshd net render cp437 ansikey telnet; do
         -i=crypto -fo="$f-ssh.o" "$f.c"
     SSHD_OBJ="$SSHD_OBJ $f-ssh.o"
 done
+# $SSHD_OBJ and $CRYPTO_OBJ are space-separated object-file lists (must word-split).
+# shellcheck disable=SC2086
 wcl -zq -bcl=dos -mm -3 -os -fm=dosshds.map \
     -fe=dosshds.exe $SSHD_OBJ ssh.o $CRYPTO_OBJ pktrecvm.obj sshtramp.obj
 cp -f dosshds.exe DOSSHDS.EXE 2>/dev/null || true

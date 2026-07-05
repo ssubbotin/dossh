@@ -132,6 +132,8 @@ pkt|ssh)
     CPUARG=""
     [ "$TRANSPORT" = ssh ] && CPUARG="-cpu pentium2"
     echo "QEMU: PCnet + $EXE_NAME, host tcp:127.0.0.1:$PORT -> guest $GUEST_IP:$PORT"
+    # $QEMU_ACCEL/$CPUARG/$MONARG are optional args that must word-split (or expand to nothing).
+    # shellcheck disable=SC2086
     exec qemu-system-i386 -machine accel=$QEMU_ACCEL -m 16 $CPUARG -fda dosshd.img -boot a \
         -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-$GUEST_IP:$PORT" \
         -device "pcnet,netdev=n0,mac=52:54:00:12:34:56" \
@@ -141,12 +143,16 @@ sshser)
     # SSH over COM1, bridged to a host TCP port. Same 386/586 CPU requirement as
     # the network SSH build. A stock `ssh` connects to the bridged port.
     echo "QEMU: COM1(SSH) -> tcp:127.0.0.1:$PORT  (ssh to this port)"
+    # $QEMU_ACCEL/$MONARG are optional args that must word-split (or expand to nothing).
+    # shellcheck disable=SC2086
     exec qemu-system-i386 -machine accel=$QEMU_ACCEL -m 16 -cpu pentium2 -fda dosshd.img -boot a \
         -serial "tcp:127.0.0.1:$PORT,server,nowait" \
         -display none -vga std $MONARG
     ;;
 *)
     echo "QEMU: COM1 -> tcp:127.0.0.1:$PORT  (connect with telnet/nc)"
+    # $QEMU_ACCEL/$MONARG are optional args that must word-split (or expand to nothing).
+    # shellcheck disable=SC2086
     exec qemu-system-i386 -machine accel=$QEMU_ACCEL -m 16 -fda dosshd.img -boot a \
         -serial "tcp:127.0.0.1:$PORT,server,nowait" \
         -display none -vga std $MONARG
