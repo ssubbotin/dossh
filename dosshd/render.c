@@ -90,19 +90,22 @@ static int shadow_valid;
 static unsigned sh_cols, sh_rows;
 static int force_kf = 1;
 static unsigned long last_kf;
+static unsigned long heal_kf;            /* tick of the last connect or screen change */
 
-static int frame_active, is_repaint, is_soft, is_toobig;
+static int frame_active, is_repaint, is_toobig;
 static unsigned walk_cell, total_cells, f_cols;
 static int last_emit, cur_sgr;
 static unsigned char last_cur_r = 255, last_cur_c = 255;
 
 #define CADENCE_TICKS 36             /* ~2 s at 18.2 Hz */
+#define HEAL_TICKS    72             /* net: resync for ~4 s after any change */
 
 void render_reset( void )
 {
     shadow_valid = 0; force_kf = 1; frame_active = 0;
     o_len = o_off = 0; pushed = -1;
     cur_sgr = -1; last_emit = -2; last_cur_r = last_cur_c = 255;
+    heal_kf = ticks();
 }
 
 /* decide whether to start a frame this fill, and of what kind */
@@ -111,8 +114,7 @@ static void frame_decide( int serial )
     unsigned cols = scr_cols(), rows = scr_rows();
     unsigned char __far *v;
     unsigned c, bytes, changed = 0, rc;
-    int repaint, clear, soft = 0;
-    (void)serial;
+    int repaint, clear;
 
     if( cols == 0 || cols > 132 ) cols = 80;
     if( rows == 0 || rows > 60  ) rows = 25;
@@ -123,13 +125,15 @@ static void frame_decide( int serial )
     /* A hard clear (ESC[2J) is only for a new connection or a geometry change. */
     clear = force_kf || !shadow_valid || cols != sh_cols || rows != sh_rows;
     repaint = clear;
-    /* Periodic SOFT full repaint on both transports: re-emit every cell without
-       a clear AND without touching the cursor (no ESC[?25l/h) - it paints over
-       identical content invisibly, so it self-heals a screen garbled by a
-       dropped repaint on a lossy link without any cursor blink. */
-    if( !repaint && (long)( ticks() - last_kf ) >= CADENCE_TICKS ) {
-        repaint = 1; soft = 1;
-    }
+    /* Periodic full repaint to self-heal a screen garbled by a dropped repaint
+       on a lossy link. On serial (no connect event) run it continuously so a
+       mid-stream terminal resyncs. On the network only for ~HEAL_TICKS after
+       the last screen change (heal_kf): that recovers cells dropped while the
+       screen was updating, then - once the screen settles - goes silent, so an
+       idle session has NO ongoing flash or text-selection reset. */
+    if( !repaint && (long)( ticks() - last_kf ) >= CADENCE_TICKS
+        && ( serial || (long)( ticks() - heal_kf ) < HEAL_TICKS ) )
+        repaint = 1;
     if( is_toobig )                  /* no shadow to diff: only full frames */
         clear = repaint = force_kf
                         || ( (long)( ticks() - last_kf ) >= CADENCE_TICKS );
@@ -147,15 +151,20 @@ static void frame_decide( int serial )
         if( changed == 0 && (unsigned char)(rc >> 8) == last_cur_r
                          && (unsigned char)rc == last_cur_c )
             return;                  /* idle - send nothing */
-        if( changed * 4 > ( bytes / 2 ) * 3 )   /* >75% cells -> soft repaint */
+        if( changed )                /* a real change: (re)arm the heal window */
+            heal_kf = ticks();
+        if( changed * 4 > ( bytes / 2 ) * 3 )   /* >75% cells changed -> repaint */
             repaint = 1;
     }
 
     f_cols = cols; total_cells = cols * rows;
-    is_repaint = repaint; is_soft = soft; walk_cell = 0;
+    is_repaint = repaint; walk_cell = 0;
     last_emit = -2; cur_sgr = -1; frame_active = 1;
-    if( !soft )
-        e_s( "\x1b[?25l" );          /* hide cursor while painting (not soft) */
+    /* ?7l: disable auto-wrap. We position every row with an absolute CUP, so we
+       never need it - and with it on, painting the bottom-right cell (24,79)
+       makes the terminal scroll up one line, flickering the last line. Sent
+       every frame so a dropped copy self-corrects. ?25l: hide cursor. */
+    e_s( "\x1b[?7l\x1b[?25l" );
     if( clear )
         e_s( "\x1b[2J\x1b[H" );
     if( repaint ) {
@@ -196,8 +205,7 @@ static void frame_fill( void )
         unsigned rc = cursor_rc();
         unsigned char cr = (unsigned char)( rc >> 8 ), cc = (unsigned char)rc;
         e_cup( cr, cc );             /* park at the DOS cursor */
-        if( !is_soft )               /* soft frame: leave cursor visibility be */
-            e_s( cursor_visible() ? "\x1b[?25h" : "\x1b[?25l" );
+        e_s( cursor_visible() ? "\x1b[?25h" : "\x1b[?25l" );
         last_cur_r = cr; last_cur_c = cc;
         frame_active = 0;
         if( !is_toobig ) shadow_valid = 1;

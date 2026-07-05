@@ -59,6 +59,28 @@ reach it from anywhere on the network.
 - **`DOSSHD.EXE`** — the DOS-side resident server (the "daemon"). It speaks
   telnet/ANSI, so the client is whatever terminal you already have.
 
+## Connecting
+
+DOSSH mirrors a **fixed 80×25** DOS text screen at absolute cursor positions. It
+does **not** negotiate or adapt to your terminal size — unlike an ordinary telnet
+server, which serves a shell whose programs reflow to the window. So your client
+terminal must be **exactly 80×25**:
+
+- **Size it to 80×25 before connecting.** On xterm/gnome-terminal:
+  `printf '\e[8;25;80t'`, or set 80×25 in the terminal profile. Verify with
+  `tput lines` → it must print **25**. Most terminals default to **24 rows** (the
+  old VT100 height) — one short for DOS, which makes the bottom line collide (the
+  shell prompt lands on top of a program's last line of output).
+- **Connect** with any terminal: `telnet <host> <port>`, `nc <host> <port>`, or
+  PuTTY (raw/telnet).
+- **Disconnect** from the client — DOSSH is a transparent KVM with no in-band
+  commands, so `exit`/`Ctrl-D` go to DOS. Use `telnet` → `Ctrl-]` then `quit`;
+  `nc` → `Ctrl-C`; PuTTY → close the window.
+
+DOSSH disables terminal auto-wrap for the session (so painting the bottom-right
+cell can't scroll the screen). If your *local* shell looks off after
+disconnecting (long lines no longer wrapping), run `reset`.
+
 ## Roadmap
 
 - [x] **MVP:** foreground server, screen mirror, keyboard injection, a
