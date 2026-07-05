@@ -96,6 +96,26 @@ void DOSSH_FAR dossh_chacha20(uint8_t *out, const uint8_t key[32],
                               const uint8_t nonce[12], uint32_t counter,
                               size_t n);
 
+/* ---- Raw ChaCha20 (original DJB variant: 64-bit nonce, 64-bit ctr) - */
+/*
+ * The original Bernstein ChaCha20 layout (8-byte nonce, 64-bit block counter),
+ * as opposed to the IETF split above. This is the exact primitive the SSH
+ * cipher chacha20-poly1305@openssh.com is built on: OpenSSH uses the 64-bit
+ * packet sequence number (big-endian, 8 bytes) as the nonce. With in==NULL the
+ * routine emits raw keystream into out; otherwise out = in XOR keystream (in
+ * and out may alias). counter selects the starting 64-byte block.
+ */
+void DOSSH_FAR dossh_chacha20_djb(uint8_t *out, const uint8_t *in, size_t n,
+                                  const uint8_t key[32], const uint8_t nonce[8],
+                                  uint32_t counter);
+
+/* ---- Poly1305 one-shot MAC (RFC 8439) ------------------------------ */
+/* One-time authenticator: tag = Poly1305(msg, key). The 32-byte key is a
+ * single-use value; disclosing a tag under a reused key reveals the key. SSH's
+ * chacha20-poly1305 derives a fresh key per packet from the ChaCha20 stream. */
+void DOSSH_FAR dossh_poly1305(uint8_t mac[16], const uint8_t *msg, size_t n,
+                              const uint8_t key[32]);
+
 /* ---- Hashes -------------------------------------------------------- */
 
 void DOSSH_FAR dossh_sha256(uint8_t hash[32], const uint8_t *msg, size_t msg_len);

@@ -13,6 +13,15 @@ BIN="${TMPDIR:-/tmp}/dossh-test-ansikey"
 echo "== build DOSSHD =="
 ( cd dosshd && ./build.sh >/dev/null )
 
+# SSH transport interop target: needs a real `ssh` binary, so it is kept out of
+# the pure-`unit` path. Runs the native harness against a stock OpenSSH client.
+if [ "$1" = "ssh" ]; then
+    echo "== ssh transport interop (real OpenSSH client) =="
+    bash test/e2e-ssh-transport.sh
+    echo "== ssh transport target passed =="
+    exit 0
+fi
+
 echo "== unit: server key map (test_ansikey.c) =="
 cc -o "$BIN" dosshd/ansikey.c test/test_ansikey.c
 "$BIN"
@@ -48,5 +57,10 @@ done
 # DOS networking stack is vendor-supplied; see docs/NETWORKING.md).
 echo "== net-smoke (opt-in via DOSSH_DRIVERS) =="
 bash test/net-smoke.sh || { echo "FAILED: net-smoke"; exit 1; }
+
+# SSH transport interop against a real OpenSSH client (self-skips if `ssh` is
+# absent). Needs cc + ssh, not QEMU, so it runs in the default sweep too.
+echo "== ssh transport interop (real OpenSSH client) =="
+bash test/e2e-ssh-transport.sh || { echo "FAILED: ssh transport interop"; exit 1; }
 
 echo "== all tests passed =="

@@ -75,9 +75,22 @@ wcl -zq -bcl=dos -mm -3 -os -dDOSSH_SSH_SUBSET -i=crypto \
     -fe=cryptot.exe ../test/cryptot.c $CRYPTO_OBJ
 cp -f cryptot.exe CRYPTOT.EXE 2>/dev/null || true
 
+# ---- SSH transport (ssh.c) DOS build + link smoke ------------------------
+# ssh.c is the SSH-2.0 transport state machine (RFC 4253): a byte-fed, non-
+# blocking handshake that far-calls the -3 crypto and rng, so it is compiled
+# with the identical medium-model 386 recipe. It is then linked into a tiny
+# real-mode EXE (test/sshlink.c) purely to PROVE it compiles AND links clean on
+# the DOS target (mixed -mm/-3 image), matching how a future SSH-enabled DOSSHD
+# would build. The FUNCTIONAL interop proof is native: test/sshd_native.c drives
+# the same ssh.c against a stock OpenSSH client (test/e2e-ssh-transport.sh).
+wcc -zq -bt=dos -mm -3 -os -zastd=c99 -dDOSSH_SSH_SUBSET -i=crypto -fo=ssh.o ssh.c
+wcl -zq -bcl=dos -mm -3 -os -dDOSSH_SSH_SUBSET -i=. -i=crypto \
+    -fe=sshlink.exe ../test/sshlink.c ssh.o $CRYPTO_OBJ
+cp -f sshlink.exe SSHLINK.EXE 2>/dev/null || true
+
 # VIDTEST: direct-video test fixture / demo app (see ../test/vidtest.c)
 (cd ../test && wcl -zq -bcl=dos -ms -0 -os -fe=vidtest.exe vidtest.c \
     && cp -f vidtest.exe VIDTEST.EXE)
 
-ls -l dosshd.exe DOSSHD.EXE CRYPTOT.EXE ../test/VIDTEST.EXE 2>/dev/null
-echo "built dosshd/DOSSHD.EXE, dosshd/CRYPTOT.EXE and test/VIDTEST.EXE"
+ls -l dosshd.exe DOSSHD.EXE CRYPTOT.EXE SSHLINK.EXE ../test/VIDTEST.EXE 2>/dev/null
+echo "built dosshd/DOSSHD.EXE, dosshd/CRYPTOT.EXE, dosshd/SSHLINK.EXE and test/VIDTEST.EXE"

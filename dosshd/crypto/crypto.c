@@ -71,6 +71,20 @@ void DOSSH_FAR dossh_chacha20(uint8_t *out, const uint8_t key[32],
 	crypto_chacha20_ietf(out, (const uint8_t *)0, n, key, nonce, counter);
 }
 
+void DOSSH_FAR dossh_chacha20_djb(uint8_t *out, const uint8_t *in, size_t n,
+                        const uint8_t key[32], const uint8_t nonce[8],
+                        uint32_t counter)
+{
+	/* in == NULL makes Monocypher emit raw keystream. */
+	crypto_chacha20_djb(out, in, n, key, nonce, (uint64_t)counter);
+}
+
+void DOSSH_FAR dossh_poly1305(uint8_t mac[16], const uint8_t *msg, size_t n,
+                        const uint8_t key[32])
+{
+	crypto_poly1305(mac, msg, n, key);
+}
+
 void DOSSH_FAR dossh_sha256(uint8_t hash[32], const uint8_t *msg, size_t msg_len)
 {
 	sha256(hash, msg, msg_len);
