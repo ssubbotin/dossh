@@ -78,6 +78,13 @@ python3 test/e2e-ssh-multiclient.py || { echo "FAILED: e2e-ssh-multiclient"; exi
 echo "-- e2e-ssh-ctrld --"
 python3 test/e2e-ssh-ctrld.py || { echo "FAILED: e2e-ssh-ctrld"; exit 1; }
 
+# Native in-DOS SSH on genuine MS-DOS 6.22 (not FreeDOS) - same DOSSHDS.EXE, driven
+# by a real ssh client. Self-skips unless MSDOS_IMG points at a bootable MS-DOS 6.22
+# floppy (6.22 is not redistributable, so it's a local/manual test; CI stays
+# FreeDOS). See docs/DESIGN-ssh.md.
+echo "-- e2e-ssh-msdos (opt-in via MSDOS_IMG) --"
+python3 test/e2e-ssh-msdos.py || { echo "FAILED: e2e-ssh-msdos"; exit 1; }
+
 # Opt-in NDIS2/DIS_PKT smoke test - builds a net floppy with net/mkbootdisk.sh
 # and drives DOSSHD over an emulated NIC. Skips unless DOSSH_DRIVERS is set (the
 # DOS networking stack is vendor-supplied; see docs/NETWORKING.md).

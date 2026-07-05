@@ -10,7 +10,10 @@ the SSH path is now multi-client** — up to `NCONN` clients each run their own
 transport + userauth + session channel, the shared screen is rendered once and
 framed+encrypted per client with that client's keys, and their keystrokes merge
 into one console, exactly like the telnet path (`test/e2e-ssh-multiclient.py`
-drives TWO real `ssh` clients at once). It still carries the DOS-entropy caveat
+drives TWO real `ssh` clients at once). Verified in QEMU on **both FreeDOS 1.2
+(the CI baseline) and genuine MS-DOS 6.22** — same `DOSSHDS.EXE`, a stock `ssh`
+authenticates and drives each (`test/e2e-ssh-msdos.py`, a local/manual test since
+6.22 isn't redistributable). It still carries the DOS-entropy caveat
 of §6, so it ships EXPERIMENTAL. The
 rest of this document is the original research/design that led there. This document
 exists so the maintainer can decide *whether* and *how* to give DOSSH a real SSH
