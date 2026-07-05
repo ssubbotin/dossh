@@ -64,15 +64,20 @@ if [ -f ../VIDTEST.EXE ]; then
     mcopy -i dosshd.img -o ../VIDTEST.EXE ::VIDTEST.EXE
 fi
 
+# optional QEMU monitor socket (set MON=/path/to.sock) for tests that inspect
+# guest state (e.g. dumping VRAM with `xp`).
+MONARG=""
+[ -n "$MON" ] && MONARG="-monitor unix:$MON,server,nowait"
+
 if [ "$TRANSPORT" = pkt ]; then
     echo "QEMU: PCnet + DOSSHD /NET, host tcp:127.0.0.1:$PORT -> guest $GUEST_IP:$PORT"
     exec qemu-system-i386 -m 16 -fda dosshd.img -boot a \
         -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-$GUEST_IP:$PORT" \
         -device "pcnet,netdev=n0,mac=52:54:00:12:34:56" \
-        -display none -vga std
+        -display none -vga std $MONARG
 else
     echo "QEMU: COM1 -> tcp:127.0.0.1:$PORT  (connect with telnet/nc)"
     exec qemu-system-i386 -m 16 -fda dosshd.img -boot a \
         -serial "tcp:127.0.0.1:$PORT,server,nowait" \
-        -display none -vga std
+        -display none -vga std $MONARG
 fi

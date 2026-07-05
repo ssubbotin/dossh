@@ -156,6 +156,30 @@ static void tx_pump( void )
 /* ---- resident interrupt handlers -------------------------------------- */
 
 static volatile int in_tick;
+static volatile int g_reboot;             /* set by the console warm-reboot sentinel */
+
+/* ansikey.c calls this when it sees the reboot sentinel; the actual reboot runs
+ * at the tick-ISR tail (never nested inside net servicing). */
+void request_reboot( void ) { g_reboot = 1; }
+
+/* Programmatic warm boot: stop the NIC, set the BIOS warm-boot flag (skip the
+ * POST memory test), and pulse the CPU reset line via the 8042 keyboard
+ * controller. Injected Ctrl+Alt+Del does NOT work (INT 9h reads the real
+ * shift-state, not the type-ahead ring), and a jump to FFFF:0000 does not reset
+ * under SeaBIOS - the 8042 reset is reliable on real hardware and QEMU. */
+static void do_reboot( void )
+{
+    volatile unsigned i;
+    g_reboot = 0;                                  /* one attempt */
+    if( g_net )                                    /* stop the NIC first */
+        net_release( net_pkt_int(), net_pkt_handle() );
+    _disable();
+    *(unsigned short __far *)MK_FP( 0x40, 0x72 ) = 0x1234;   /* 1234h = warm */
+    outp( 0x64, 0xFE );                            /* 8042: pulse CPU reset */
+    for( i = 0; i < 60000U; i++ )                  /* wait for it to fire */
+        ;
+    _enable();                                     /* did not reset? resume */
+}
 
 static void net_tick( void )
 {
@@ -194,6 +218,8 @@ static void __interrupt __far tick_isr( void )
         }
         in_tick = 0;
     }
+    if( g_reboot )                            /* console asked for a warm reboot */
+        do_reboot();                          /* ... at the tail; never returns */
     _chain_intr( state.old_1c );
 }
 

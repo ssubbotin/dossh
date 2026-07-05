@@ -25,6 +25,9 @@ void inject_key( unsigned char scan, unsigned char ascii )
     got_n++;
 }
 
+static int reboots;
+void request_reboot( void ) { reboots++; }
+
 static int failures;
 
 /* feed a byte string, then assert exactly the expected (scan,ascii) pairs */
@@ -94,6 +97,24 @@ int main( void )
     check( "lone ESC", IN(0x1B), 1, 2, EXP(0x01,0x1B), 1 );
     /* ESC followed by a letter: ESC then the letter */
     check( "ESC then a", IN(0x1B,'a'), 2, 0, EXP(0x01,0x1B, 0x1E,'a'), 2 );
+
+    /* warm-reboot sentinel: 0x1E x3 then Y -> request_reboot, no keys injected */
+    reboots = 0; got_n = 0;
+    { const unsigned char *s = IN(0x1E,0x1E,0x1E,'Y'); int i;
+      for( i = 0; i < 4; i++ ) ansi_key_byte( s[i] ); }
+    if( reboots == 1 && got_n == 0 )
+        printf( "  ok   reboot sentinel (0x1E x3, Y)\n" );
+    else { failures++; printf( "  FAIL reboot sentinel: reboots=%d keys=%d\n",
+                               reboots, got_n ); }
+
+    /* a non-Y after 0x1E x3 cancels: no reboot, and that byte injects normally */
+    reboots = 0; got_n = 0;
+    { const unsigned char *s = IN(0x1E,0x1E,0x1E,'a'); int i;
+      for( i = 0; i < 4; i++ ) ansi_key_byte( s[i] ); }
+    if( reboots == 0 && got_n == 1 && got_scan[0] == 0x1E && got_ascii[0] == 'a' )
+        printf( "  ok   reboot sentinel cancels on non-Y\n" );
+    else { failures++; printf( "  FAIL reboot cancel: reboots=%d keys=%d\n",
+                               reboots, got_n ); }
 
     printf( failures ? "test_ansikey: %d FAILED\n" : "test_ansikey: all passed\n",
             failures );

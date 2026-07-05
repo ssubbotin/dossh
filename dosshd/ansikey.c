@@ -12,6 +12,8 @@
 
 /* provided by dosshd.c: poke (scancode<<8|ascii) into the BIOS type-ahead ring */
 extern void inject_key( unsigned char scan, unsigned char ascii );
+/* provided by dosshd.c: request a warm reboot (executed at the tick-ISR tail) */
+extern void request_reboot( void );
 
 /* ---- US-layout scancode tables (built at init) ----------------------- */
 static unsigned char scan[128];      /* base char -> scancode-set-1 make code */
@@ -92,6 +94,7 @@ static unsigned char pend[12];
 static int pendlen;
 static int pend_age;
 static int swallow;      /* after CR, swallow a following LF/NUL */
+static int rb_state;     /* warm-reboot sentinel: count of leading 0x1E bytes */
 
 static void finish_csi( unsigned char final )
 {
@@ -112,6 +115,21 @@ static void finish_csi( unsigned char final )
 
 void ansi_key_byte( unsigned char b )
 {
+    /* Warm-reboot sentinel: three Ctrl-^ (0x1E) then Y/y. 0x1E is dropped by
+       map_byte (it never reaches DOS), so reserving it costs no keystroke, and
+       three-in-a-row plus a Y confirm can't be fat-fingered by accident. */
+    if( b == 0x1E ) {
+        if( rb_state < 3 ) rb_state++;
+        return;
+    }
+    if( rb_state >= 3 ) {
+        rb_state = 0;
+        if( b == 'Y' || b == 'y' ) { request_reboot(); return; }
+        /* anything else cancels; fall through and handle b normally */
+    } else {
+        rb_state = 0;
+    }
+
     if( swallow ) {                       /* CR was just sent */
         swallow = 0;
         if( b == 0x0A || b == 0x00 ) return;   /* swallow the paired LF/NUL */

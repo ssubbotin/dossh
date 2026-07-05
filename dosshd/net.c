@@ -545,7 +545,10 @@ unsigned      net_pkt_handle( void ) { return pkt_handle; }
 
 void net_release( unsigned char int_no, unsigned handle )
 {
-    union REGS r;
+    /* static (DGROUP): this is also called from the warm-reboot path in the
+       timer ISR, where SS != DS - a stack local passed to int86 would be
+       dereferenced against DS and read garbage. */
+    static union REGS r;
     r.h.ah = 0x03;             /* release_type */
     r.x.bx = handle;
     int86( int_no, &r, &r );

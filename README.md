@@ -84,9 +84,15 @@ last line of output), so the `printf`/`tput` step matters. If `tput lines` still
 shows 24, your terminal ignored the resize escape — set 80×25 via the window or
 the terminal profile instead.
 
-**Disconnect** from the client — DOSSH is a transparent KVM with no in-band
-commands, so `exit`/`Ctrl-D` go to DOS. Use `telnet` → `Ctrl-]` then `quit`;
-`nc` → `Ctrl-C`; PuTTY → close the window.
+**Disconnect** from the client — `exit`/`Ctrl-D` are forwarded to DOS, not to the
+link, so close from the client: `telnet` → `Ctrl-]` then `quit`; `nc` →
+`Ctrl-C`; PuTTY → close the window.
+
+**Reboot the box** — type **`Ctrl-^` three times then `Y`** (`0x1E` ×3, then
+`Y`; `Ctrl-^` is Ctrl-Shift-6 on a US keyboard). This warm-boots the DOS machine
+(skips the POST memory test). It is a deliberate sequence that cannot be
+fat-fingered, and it needs DOS to still be responsive — for a *hung* box, use an
+external power-cycle instead (a software reboot can't recover a dead box).
 
 DOSSH disables terminal auto-wrap for the session (so painting the bottom-right
 cell can't scroll the screen). If your *local* shell looks off after
