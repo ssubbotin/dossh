@@ -71,10 +71,23 @@ pkt_receiver_   endp
 
 ; void pkt_send_bigstack(void) - issue packet-driver send_pkt (AH=4, DS:SI =
 ; buffer from _sc_bufoff, CX = _sc_len) at software interrupt _sc_int, run on a
-; private DGROUP stack with interrupts disabled. Returns CF (0=ok,1=err) in
-; _sc_cf. The frame buffer (g_txbuf) is in DGROUP, so DS already addresses it;
-; only SS:SP is switched. The driver is reached through its IVT vector (rather
-; than a fixed INT opcode), so it works wherever the driver installed.
+; private DGROUP stack. Returns CF (0=ok,1=err) in _sc_cf. The frame buffer
+; (g_txbuf) is in DGROUP, so DS already addresses it; only SS:SP is switched.
+; The driver is reached through its IVT vector (rather than a fixed INT opcode),
+; so it works wherever the driver installed.
+;
+; Interrupt state: a blind-DMA driver (AMD PCNTPK) returns immediately, but a
+; blocking NDIS2 shim (DIS_PKT) does not return from send_pkt until the NIC's
+; TX-complete IRQ fires. We run from the INT 1Ch timer tick, i.e. inside the
+; BIOS INT 08h handler, where IRQ0 is still in service at the 8259 (its EOI is
+; issued only after INT 1Ch returns) and IF is clear - so no lower-priority IRQ,
+; including the NIC's, can ever be delivered and the shim deadlocks. We
+; therefore issue a non-specific EOI for IRQ0 and STI around the driver call so
+; the completion IRQ (and the driver's own receive upcall) can run. Re-entry of
+; the TX path during this window is already prevented by the C-side in_tick
+; guard (see dosshd.c) and the pkt_send `sending` guard (net.c); a nested INT
+; 1Ch no-ops, and the receive upcall only touches pkt_stage, never g_txbuf. The
+; BIOS INT 08h's own trailing EOI is then a harmless second non-specific EOI.
         public  pkt_send_bigstack_
 pkt_send_bigstack_ proc near
         cli
@@ -94,8 +107,14 @@ pkt_send_bigstack_ proc near
         xor     ax, ax
         mov     es, ax                ; ES = 0 (IVT segment)
         mov     bx, bs_ivt
+        ; Release IRQ0 at the master 8259 and enable interrupts so a blocking
+        ; shim driver's TX-complete IRQ can be delivered (see header). Harmless
+        ; for a blind-DMA driver, which returns before any of this matters.
+        mov     al, 20h
+        out     20h, al               ; non-specific EOI -> unblock lower IRQs
         mov     ah, 4                 ; send_pkt
-        pushf                         ; simulate INT: flags, then far-call handler
+        sti                           ; let the completion IRQ fire
+        pushf                         ; simulate INT: flags (IF=1), far-call handler
         call    dword ptr es:[bx]
         pushf
         pop     ax                    ; ax = returned flags (CF = result)

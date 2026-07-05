@@ -108,14 +108,24 @@ extern volatile unsigned      sc_bufoff;
 extern volatile unsigned      sc_len;
 extern volatile unsigned char sc_cf;
 
+static volatile int sending;   /* guards g_txbuf across the STI send window */
+
 static void pkt_send( unsigned len )
 {
     void __far *buf = (void __far *)g_txbuf;
 
+    /* pkt_send_bigstack enables interrupts around a (possibly blocking) driver
+     * send so an NDIS2 shim's TX-complete IRQ can fire. The tick path is
+     * single-threaded via in_tick, but if an IRQ ever re-enters the TX path
+     * mid-send, drop the frame rather than clobber g_txbuf - TCP retransmits. */
+    if( sending )
+        return;
+    sending = 1;
     sc_int    = pkt_int;
     sc_bufoff = FP_OFF( buf );
     sc_len    = len;
-    pkt_send_bigstack();       /* send_pkt AH=4 on a private stack, IF=0 */
+    pkt_send_bigstack();       /* send_pkt AH=4 on a private stack, EOI+STI */
+    sending = 0;
 }
 
 static void pkt_release( void )
